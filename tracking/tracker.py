@@ -1,421 +1,304 @@
 """
-Enhanced Robot Tracker with Advanced Features
-Improves tracking robustness for occlusions, fast motion, and collisions
+Two-robot tracker for robot sumo matches.
+- Keeps stable IDs (1 and 2 only)
+- Handles temporary occlusions
+- Estimates front/blade point per robot
 """
+
+from dataclasses import dataclass
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass
-from collections import deque
 
 
 @dataclass
 class RobotState:
-    """Enhanced robot state with tracking history"""
     id: int
     position: Tuple[int, int]
     velocity: Tuple[float, float]
-    color_histogram: np.ndarray
+    bbox: Tuple[int, int, int, int]
     confidence: float
-    frames_tracked: int
     frames_lost: int
-    bbox: Tuple[int, int, int, int]  # x, y, w, h
-    position_history: deque  # Last N positions for smoothing
+    position_history: Deque[Tuple[int, int]]
+    color_histogram: np.ndarray
     front_point: Tuple[int, int]
     heading_deg: float
     occluded: bool
-    
-    def __post_init__(self):
-        if not isinstance(self.position_history, deque):
-            self.position_history = deque(maxlen=10)
 
 
 class RobotTracker:
-    """
-    Advanced robot tracker with:
-    - Kalman filtering for motion prediction
-    - Color histogram matching for re-identification
-    - Occlusion handling
-    - Collision detection and recovery
-    """
-    
-    def __init__(self, 
-                 dohyo_center: Tuple[int, int],
-                 dohyo_radius: int,
-                 max_lost_frames: int = 15,
-                 position_history_size: int = 10):
+    """Tracks exactly two robots inside dohyo and exposes blade/front estimate."""
+
+    def __init__(
+        self,
+        dohyo_center: Tuple[int, int],
+        dohyo_radius: int,
+        max_lost_frames: int = 30,
+        position_history_size: int = 20,
+    ):
         self.dohyo_center = dohyo_center
         self.dohyo_radius = dohyo_radius
         self.max_lost_frames = max_lost_frames
         self.position_history_size = position_history_size
-        
+
         self.robots: Dict[int, RobotState] = {}
-        self.next_id = 1
         self.frame_count = 0
-        
-        # Detection parameters
-        self.min_robot_size = 20  # pixels
-        self.max_robot_size = dohyo_radius // 2
-        self.color_match_threshold = 0.7
         self.prev_gray: Optional[np.ndarray] = None
-        self.max_track_count = 2
-        
-    def _estimate_front_point(self, frame: np.ndarray, contour: np.ndarray, center: Tuple[int, int]) -> Tuple[Tuple[int, int], float]:
-        """Estimate robot front edge by combining geometric heading and shiny blade cue."""
+
+        # Tuned for 3kg mega sumo visual footprint in common 1080p-ish recordings.
+        self.min_area = 300
+        self.max_area = int(np.pi * (dohyo_radius * 0.35) ** 2)
+
+    def _inside_dohyo(self, p: Tuple[int, int], margin: float = 0.98) -> bool:
+        d = np.hypot(p[0] - self.dohyo_center[0], p[1] - self.dohyo_center[1])
+        return d <= self.dohyo_radius * margin
+
+    def _estimate_front_point(
+        self, frame: np.ndarray, contour: np.ndarray, center: Tuple[int, int]
+    ) -> Tuple[Tuple[int, int], float]:
+        """Estimate front using minAreaRect axis + shiny metal cue."""
         rect = cv2.minAreaRect(contour)
         box = cv2.boxPoints(rect).astype(np.int32)
 
-        # Prefer the longer side as heading axis, then orient it to point away from dohyo center.
         v1 = box[1] - box[0]
         v2 = box[2] - box[1]
         axis = v1 if np.linalg.norm(v1) >= np.linalg.norm(v2) else v2
         axis = axis.astype(np.float32)
-        axis_norm = np.linalg.norm(axis) + 1e-6
-        axis /= axis_norm
+        axis = axis / (np.linalg.norm(axis) + 1e-6)
 
-        radial = np.array([center[0] - self.dohyo_center[0], center[1] - self.dohyo_center[1]], dtype=np.float32)
+        # Prefer outward-facing direction from dohyo center.
+        radial = np.array(
+            [center[0] - self.dohyo_center[0], center[1] - self.dohyo_center[1]],
+            dtype=np.float32,
+        )
         if np.dot(axis, radial) < 0:
             axis = -axis
 
-        # Geometry candidate: contour point furthest along heading axis.
-        contour_pts = contour.reshape(-1, 2)
-        proj = contour_pts @ axis
-        front_geom = contour_pts[int(np.argmax(proj))]
+        pts = contour.reshape(-1, 2)
+        geom_front = pts[int(np.argmax(pts @ axis))]
 
-        # Blade candidate: brightest pixel cluster (shiny metal wedges).
         x, y, w, h = cv2.boundingRect(contour)
-        roi = frame[y:y + h, x:x + w]
-        front_blade = front_geom
+        roi = frame[y : y + h, x : x + w]
+        blade_front = geom_front
         if roi.size > 0:
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            bright = cv2.inRange(hsv, np.array([0, 0, 160]), np.array([180, 70, 255]))
-            if np.count_nonzero(bright) > (w * h * 0.01):
+            # Low sat + high value catches shiny metallic blades.
+            bright = cv2.inRange(hsv, np.array([0, 0, 140]), np.array([180, 90, 255]))
+            if np.count_nonzero(bright) > (w * h * 0.008):
                 ys, xs = np.where(bright > 0)
-                blade_points = np.stack([xs + x, ys + y], axis=1)
-                blade_proj = blade_points @ axis
-                front_blade = blade_points[int(np.argmax(blade_proj))]
+                bright_pts = np.stack([xs + x, ys + y], axis=1)
+                blade_front = bright_pts[int(np.argmax(bright_pts @ axis))]
 
-        # Blend robustly between geometric and shiny-blade cues.
-        front = np.round(0.6 * front_geom + 0.4 * front_blade).astype(int)
+        front = np.round(0.65 * geom_front + 0.35 * blade_front).astype(int)
         heading_deg = float(np.degrees(np.arctan2(axis[1], axis[0])))
         return (int(front[0]), int(front[1])), heading_deg
 
     def detect_robots(self, frame: np.ndarray) -> List[Dict]:
-        """
-        Detect robot candidates in frame
-        Returns list of detections with position, size, color histogram
-        """
-        # Create dohyo mask
-        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-        cv2.circle(mask, self.dohyo_center, self.dohyo_radius, 255, -1)
-        
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        """Return up to two robot candidates from fused segmentation."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Detect darker structure and moving objects (handles bright robots too)
-        _, dark_thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        motion_mask = np.zeros_like(gray)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # Dohyo circular mask
+        mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.circle(mask, self.dohyo_center, self.dohyo_radius, 255, -1)
+
+        # Black robots on black dohyo is hard: fuse motion and edge-rich areas.
+        edges = cv2.Canny(gray, 60, 160)
+        _, dark = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        motion = np.zeros_like(gray)
         if self.prev_gray is not None:
             diff = cv2.absdiff(gray, self.prev_gray)
-            _, motion_mask = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
+            _, motion = cv2.threshold(diff, 14, 255, cv2.THRESH_BINARY)
         self.prev_gray = gray
 
-        combined = cv2.bitwise_or(dark_thresh, motion_mask)
-        
-        # Apply morphology to clean up
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
-        
-        # Mask to dohyo area only
-        combined = cv2.bitwise_and(combined, mask)
-        
-        # Find contours
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        detections = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            
-            # Size filtering
-            if area < self.min_robot_size**2 or area > self.max_robot_size**2:
+        fused = cv2.bitwise_or(dark, motion)
+        fused = cv2.bitwise_or(fused, edges)
+        fused = cv2.bitwise_and(fused, mask)
+
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        fused = cv2.morphologyEx(fused, cv2.MORPH_CLOSE, k)
+        fused = cv2.morphologyEx(fused, cv2.MORPH_OPEN, k)
+
+        contours, _ = cv2.findContours(fused, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        candidates: List[Dict] = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < self.min_area or area > self.max_area:
                 continue
-            
-            # Get bounding box
-            x, y, w, h = cv2.boundingRect(contour)
-            
-            # Aspect ratio check (robots are roughly circular/square)
-            aspect_ratio = float(w) / h if h > 0 else 0
-            if aspect_ratio < 0.4 or aspect_ratio > 2.5:
+
+            x, y, w, h = cv2.boundingRect(cnt)
+            if w <= 0 or h <= 0:
                 continue
-            
-            # Center position
-            M = cv2.moments(contour)
-            if M["m00"] == 0:
+            ar = w / float(h)
+            if ar < 0.25 or ar > 4.0:
                 continue
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            
-            # Check if inside dohyo
-            dist_from_center = np.sqrt((cx - self.dohyo_center[0])**2 + 
-                                      (cy - self.dohyo_center[1])**2)
-            if dist_from_center > self.dohyo_radius * 0.95:
+
+            m = cv2.moments(cnt)
+            if m["m00"] == 0:
                 continue
-            
-            # Extract color histogram for tracking
-            roi_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-            cv2.drawContours(roi_mask, [contour], 0, 255, -1)
-            
-            # Color histogram in HSV space (more robust than BGR)
-            hist = cv2.calcHist([hsv], [0, 1], roi_mask, [30, 32], [0, 180, 0, 256])
+            cx = int(m["m10"] / m["m00"])
+            cy = int(m["m01"] / m["m00"])
+            if not self._inside_dohyo((cx, cy)):
+                continue
+
+            roi_mask = np.zeros(gray.shape, dtype=np.uint8)
+            cv2.drawContours(roi_mask, [cnt], -1, 255, -1)
+            hist = cv2.calcHist([hsv], [0, 1], roi_mask, [32, 32], [0, 180, 0, 256])
             hist = cv2.normalize(hist, hist).flatten()
-            
-            front_point, heading_deg = self._estimate_front_point(frame, contour, (cx, cy))
 
-            detections.append({
-                'position': (cx, cy),
-                'bbox': (x, y, w, h),
-                'area': area,
-                'contour': contour,
-                'color_histogram': hist,
-                'front_point': front_point,
-                'heading_deg': heading_deg,
-            })
+            front_point, heading_deg = self._estimate_front_point(frame, cnt, (cx, cy))
+            candidates.append(
+                {
+                    "position": (cx, cy),
+                    "bbox": (x, y, w, h),
+                    "area": area,
+                    "hist": hist,
+                    "front_point": front_point,
+                    "heading_deg": heading_deg,
+                }
+            )
 
-        detections.sort(key=lambda d: d['area'], reverse=True)
-        detections = detections[:self.max_track_count]
-        
-        return detections
-    
-    def match_detections_to_tracks(self, 
-                                   detections: List[Dict]) -> Tuple[List, List, List]:
-        """
-        Match detections to existing tracks using:
-        1. Predicted position (motion model)
-        2. Color histogram similarity
-        3. Size consistency
-        
-        Returns: (matched_pairs, unmatched_detections, unmatched_tracks)
-        """
-        if not self.robots:
-            return [], list(range(len(detections))), []
-        
-        # Predict robot positions based on velocity
-        predictions = {}
-        for robot_id, robot in self.robots.items():
-            pred_x = robot.position[0] + robot.velocity[0]
-            pred_y = robot.position[1] + robot.velocity[1]
-            predictions[robot_id] = (pred_x, pred_y)
-        
-        # Compute cost matrix: distance + color difference
-        cost_matrix = np.zeros((len(self.robots), len(detections)))
-        robot_ids = list(self.robots.keys())
-        
-        for i, robot_id in enumerate(robot_ids):
-            robot = self.robots[robot_id]
-            pred_pos = predictions[robot_id]
-            
-            for j, detection in enumerate(detections):
-                det_pos = detection['position']
-                
-                # Position distance (normalized by expected motion range)
-                pos_dist = np.sqrt((pred_pos[0] - det_pos[0])**2 + 
-                                  (pred_pos[1] - det_pos[1])**2)
-                pos_cost = pos_dist / 100.0  # Normalize
-                
-                # Color histogram similarity (using correlation)
-                color_sim = cv2.compareHist(robot.color_histogram, 
-                                           detection['color_histogram'],
-                                           cv2.HISTCMP_CORREL)
-                color_cost = 1.0 - color_sim  # Convert similarity to cost
-                
-                # Combined cost (weighted)
-                cost_matrix[i, j] = 0.6 * pos_cost + 0.4 * color_cost
-        
-        # Hungarian algorithm for optimal assignment
-        from scipy.optimize import linear_sum_assignment
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-        
-        # Filter matches with high cost (likely wrong matches)
-        matched_pairs = []
-        max_acceptable_cost = 0.5
-        
-        for r, c in zip(row_ind, col_ind):
-            if cost_matrix[r, c] < max_acceptable_cost:
-                matched_pairs.append((robot_ids[r], c))
-        
-        # Unmatched detections and tracks
-        matched_detection_indices = [c for _, c in matched_pairs]
-        unmatched_detections = [i for i in range(len(detections)) 
-                               if i not in matched_detection_indices]
-        
-        matched_robot_ids = [rid for rid, _ in matched_pairs]
-        unmatched_tracks = [rid for rid in robot_ids 
-                           if rid not in matched_robot_ids]
-        
-        return matched_pairs, unmatched_detections, unmatched_tracks
-    
-    def update(self, frame: np.ndarray) -> Dict[int, RobotState]:
-        """
-        Update tracking for current frame
-        
-        Returns: Dictionary of active robot tracks {id: RobotState}
-        """
-        self.frame_count += 1
-        
-        # Detect robots in current frame
-        detections = self.detect_robots(frame)
-        
-        # Match detections to existing tracks
-        matched_pairs, unmatched_det, unmatched_tracks = \
-            self.match_detections_to_tracks(detections)
+        candidates.sort(key=lambda d: d["area"], reverse=True)
+        return candidates[:2]
 
-        # Occlusion handling: one merged contour while we expect two robots.
-        if len(detections) == 1 and len(self.robots) >= 2:
-            for robot in self.robots.values():
-                robot.frames_lost += 1
-                robot.occluded = True
-                robot.confidence = max(0.2, robot.confidence - 0.08)
-                pred_x = robot.position[0] + robot.velocity[0]
-                pred_y = robot.position[1] + robot.velocity[1]
-                robot.position = (int(pred_x), int(pred_y))
-            return self.robots
-        
-        # Update matched tracks
-        for robot_id, det_idx in matched_pairs:
-            detection = detections[det_idx]
-            robot = self.robots[robot_id]
-            
-            # Update position
-            new_pos = detection['position']
-            old_pos = robot.position
-            
-            # Calculate velocity (smoothed)
-            vx = 0.7 * robot.velocity[0] + 0.3 * (new_pos[0] - old_pos[0])
-            vy = 0.7 * robot.velocity[1] + 0.3 * (new_pos[1] - old_pos[1])
-            
-            # Update state
-            robot.position = new_pos
-            robot.velocity = (vx, vy)
-            robot.bbox = detection['bbox']
-            robot.position_history.append(new_pos)
-            robot.front_point = detection['front_point']
-            robot.heading_deg = detection['heading_deg']
-            robot.occluded = False
-            robot.frames_tracked += 1
-            robot.frames_lost = 0
-            robot.confidence = min(1.0, robot.confidence + 0.1)
-            
-            # Update color histogram (slow adaptation for lighting changes)
-            robot.color_histogram = 0.9 * robot.color_histogram + \
-                                   0.1 * detection['color_histogram']
-        
-        # Handle unmatched tracks (potentially occluded or left dohyo)
-        for robot_id in unmatched_tracks:
-            robot = self.robots[robot_id]
-            robot.frames_lost += 1
-            robot.occluded = True
-            robot.confidence = max(0.0, robot.confidence - 0.2)
-            
-            # Predict position using velocity
-            pred_x = robot.position[0] + robot.velocity[0]
-            pred_y = robot.position[1] + robot.velocity[1]
-            robot.position = (int(pred_x), int(pred_y))
-            
-            # Remove track if lost too long
-            if robot.frames_lost > self.max_lost_frames:
-                del self.robots[robot_id]
-        
-        # Create new tracks for unmatched detections
-        for det_idx in unmatched_det:
-            detection = detections[det_idx]
-            
-            new_robot = RobotState(
-                id=self.next_id,
-                position=detection['position'],
+    def _init_tracks(self, detections: List[Dict]) -> None:
+        """Initialize exactly two tracks when possible."""
+        if len(detections) < 2 or self.robots:
+            return
+        for rid, det in enumerate(detections[:2], start=1):
+            self.robots[rid] = RobotState(
+                id=rid,
+                position=det["position"],
                 velocity=(0.0, 0.0),
-                color_histogram=detection['color_histogram'],
-                confidence=0.5,
-                frames_tracked=1,
+                bbox=det["bbox"],
+                confidence=0.8,
                 frames_lost=0,
-                bbox=detection['bbox'],
-                position_history=deque([detection['position']], 
-                                      maxlen=self.position_history_size),
-                front_point=detection['front_point'],
-                heading_deg=detection['heading_deg'],
+                position_history=deque([det["position"]], maxlen=self.position_history_size),
+                color_histogram=det["hist"],
+                front_point=det["front_point"],
+                heading_deg=det["heading_deg"],
                 occluded=False,
             )
-            
-            self.robots[self.next_id] = new_robot
-            self.next_id += 1
-        
-        return self.robots
-    
-    def get_smoothed_position(self, robot_id: int) -> Optional[Tuple[int, int]]:
-        """Get smoothed position using position history"""
-        if robot_id not in self.robots:
-            return None
-        
-        robot = self.robots[robot_id]
-        if len(robot.position_history) == 0:
-            return robot.position
-        
-        # Average last N positions
-        positions = list(robot.position_history)
-        avg_x = int(np.mean([p[0] for p in positions]))
-        avg_y = int(np.mean([p[1] for p in positions]))
-        
-        return (avg_x, avg_y)
-    
-    def draw_tracks(self, frame: np.ndarray, 
-                   show_trails: bool = True,
-                   show_ids: bool = True) -> np.ndarray:
-        """Draw tracking visualization"""
-        result = frame.copy()
-        
-        for robot_id, robot in self.robots.items():
-            # Color based on confidence
-            if robot.confidence > 0.7:
-                color = (0, 255, 0)  # Green = high confidence
-            elif robot.confidence > 0.4:
-                color = (0, 255, 255)  # Yellow = medium
-            else:
-                color = (0, 165, 255)  # Orange = low confidence
-            
-            # Draw bounding box
-            x, y, w, h = robot.bbox
-            cv2.rectangle(result, (x, y), (x + w, y + h), color, 2)
-            
-            # Draw center point
-            cv2.circle(result, robot.position, 5, color, -1)
-            
-            # Draw ID
-            if show_ids:
-                occ = " OCC" if robot.occluded else ""
-                cv2.putText(result, f"R{robot_id}{occ}", 
-                           (robot.position[0] - 10, robot.position[1] - 15),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-            # Front indicator and heading vector
-            cv2.circle(result, robot.front_point, 4, (255, 255, 0), -1)
-            cv2.line(result, robot.position, robot.front_point, (255, 255, 0), 2)
-            
-            # Draw velocity vector
-            if np.linalg.norm(robot.velocity) > 1:
-                end_x = int(robot.position[0] + robot.velocity[0] * 3)
-                end_y = int(robot.position[1] + robot.velocity[1] * 3)
-                cv2.arrowedLine(result, robot.position, (end_x, end_y), 
-                               color, 2, tipLength=0.3)
-            
-            # Draw trail
-            if show_trails and len(robot.position_history) > 1:
-                points = np.array(list(robot.position_history), dtype=np.int32)
-                cv2.polylines(result, [points], False, color, 1)
-        
-        # Draw info
-        info_text = f"Tracking: {len(self.robots)} robots | Frame: {self.frame_count}"
-        cv2.putText(result, info_text, (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        return result
+    def _match_two_tracks(self, detections: List[Dict]) -> Dict[int, Optional[int]]:
+        """Return mapping track_id -> detection index (or None)."""
+        if not self.robots:
+            return {}
+
+        track_ids = sorted(self.robots.keys())[:2]
+        if not detections:
+            return {tid: None for tid in track_ids}
+
+        costs = []
+        for tid in track_ids:
+            r = self.robots[tid]
+            pred = (r.position[0] + r.velocity[0], r.position[1] + r.velocity[1])
+            row = []
+            for d in detections:
+                pos_dist = np.hypot(pred[0] - d["position"][0], pred[1] - d["position"][1])
+                pos_cost = pos_dist / 140.0
+                color_sim = cv2.compareHist(r.color_histogram, d["hist"], cv2.HISTCMP_CORREL)
+                color_cost = 1.0 - max(-1.0, min(1.0, color_sim))
+                row.append(0.75 * pos_cost + 0.25 * color_cost)
+            costs.append(row)
+
+        # Since we have max 2x2, brute-force assignments.
+        mapping = {tid: None for tid in track_ids}
+        if len(track_ids) == 1:
+            best_j = int(np.argmin(costs[0]))
+            if costs[0][best_j] < 0.85:
+                mapping[track_ids[0]] = best_j
+            return mapping
+
+        if len(detections) == 1:
+            best_tid = track_ids[int(np.argmin([costs[0][0], costs[1][0]]))]
+            if min(costs[0][0], costs[1][0]) < 0.85:
+                mapping[best_tid] = 0
+            return mapping
+
+        c00, c01 = costs[0][0], costs[0][1]
+        c10, c11 = costs[1][0], costs[1][1]
+        if (c00 + c11) <= (c01 + c10):
+            if c00 < 0.85:
+                mapping[track_ids[0]] = 0
+            if c11 < 0.85:
+                mapping[track_ids[1]] = 1
+        else:
+            if c01 < 0.85:
+                mapping[track_ids[0]] = 1
+            if c10 < 0.85:
+                mapping[track_ids[1]] = 0
+        return mapping
+
+    def update(self, frame: np.ndarray) -> Dict[int, RobotState]:
+        self.frame_count += 1
+        detections = self.detect_robots(frame)
+        self._init_tracks(detections)
+
+        # Track IDs are fixed (1 and 2 once initialized); never spawn 3rd+ robot IDs.
+        if not self.robots:
+            return self.robots
+
+        assign = self._match_two_tracks(detections)
+
+        for rid, robot in self.robots.items():
+            det_idx = assign.get(rid, None)
+            if det_idx is None:
+                robot.frames_lost += 1
+                robot.occluded = True
+                robot.confidence = max(0.05, robot.confidence - 0.06)
+                px = int(robot.position[0] + robot.velocity[0])
+                py = int(robot.position[1] + robot.velocity[1])
+                robot.position = (px, py)
+                robot.position_history.append(robot.position)
+                continue
+
+            det = detections[det_idx]
+            old = robot.position
+            new = det["position"]
+            vx = 0.65 * robot.velocity[0] + 0.35 * (new[0] - old[0])
+            vy = 0.65 * robot.velocity[1] + 0.35 * (new[1] - old[1])
+
+            robot.position = new
+            robot.velocity = (vx, vy)
+            robot.bbox = det["bbox"]
+            robot.frames_lost = 0
+            robot.occluded = False
+            robot.confidence = min(1.0, robot.confidence + 0.04)
+            robot.position_history.append(new)
+            robot.front_point = det["front_point"]
+            robot.heading_deg = det["heading_deg"]
+            robot.color_histogram = 0.9 * robot.color_histogram + 0.1 * det["hist"]
+
+        # keep tracks present even if briefly lost, but hard reset if totally gone too long
+        if all(r.frames_lost > self.max_lost_frames for r in self.robots.values()):
+            self.robots = {}
+
+        return self.robots
+
+    def draw_tracks(self, frame: np.ndarray) -> np.ndarray:
+        out = frame.copy()
+        for rid in sorted(self.robots.keys()):
+            r = self.robots[rid]
+            color = (0, 255, 0) if not r.occluded else (0, 255, 255)
+            x, y, w, h = r.bbox
+            cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
+            cv2.circle(out, r.position, 5, (0, 0, 255), -1)
+            cv2.circle(out, r.front_point, 4, (255, 255, 0), -1)
+            cv2.line(out, r.position, r.front_point, (255, 255, 0), 2)
+            label = f"R{rid} {r.confidence:.2f}"
+            if r.occluded:
+                label += " OCC"
+            cv2.putText(out, label, (r.position[0] - 30, r.position[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            if len(r.position_history) > 1:
+                pts = np.array(list(r.position_history), dtype=np.int32)
+                cv2.polylines(out, [pts], False, color, 1)
+
+        cv2.circle(out, self.dohyo_center, self.dohyo_radius, (0, 255, 0), 3)
+        cv2.putText(out, f"Frame: {self.frame_count} | Tracks: {len(self.robots)}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        return out
