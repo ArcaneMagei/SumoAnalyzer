@@ -22,6 +22,9 @@ class RobotState:
     frames_lost: int
     bbox: Tuple[int, int, int, int]  # x, y, w, h
     position_history: deque  # Last N positions for smoothing
+    front_point: Tuple[int, int]
+    heading_deg: float
+    occluded: bool
     
     def __post_init__(self):
         if not isinstance(self.position_history, deque):
@@ -55,7 +58,49 @@ class RobotTracker:
         self.min_robot_size = 20  # pixels
         self.max_robot_size = dohyo_radius // 2
         self.color_match_threshold = 0.7
+        self.prev_gray: Optional[np.ndarray] = None
+        self.max_track_count = 2
         
+    def _estimate_front_point(self, frame: np.ndarray, contour: np.ndarray, center: Tuple[int, int]) -> Tuple[Tuple[int, int], float]:
+        """Estimate robot front edge by combining geometric heading and shiny blade cue."""
+        rect = cv2.minAreaRect(contour)
+        box = cv2.boxPoints(rect).astype(np.int32)
+
+        # Prefer the longer side as heading axis, then orient it to point away from dohyo center.
+        v1 = box[1] - box[0]
+        v2 = box[2] - box[1]
+        axis = v1 if np.linalg.norm(v1) >= np.linalg.norm(v2) else v2
+        axis = axis.astype(np.float32)
+        axis_norm = np.linalg.norm(axis) + 1e-6
+        axis /= axis_norm
+
+        radial = np.array([center[0] - self.dohyo_center[0], center[1] - self.dohyo_center[1]], dtype=np.float32)
+        if np.dot(axis, radial) < 0:
+            axis = -axis
+
+        # Geometry candidate: contour point furthest along heading axis.
+        contour_pts = contour.reshape(-1, 2)
+        proj = contour_pts @ axis
+        front_geom = contour_pts[int(np.argmax(proj))]
+
+        # Blade candidate: brightest pixel cluster (shiny metal wedges).
+        x, y, w, h = cv2.boundingRect(contour)
+        roi = frame[y:y + h, x:x + w]
+        front_blade = front_geom
+        if roi.size > 0:
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            bright = cv2.inRange(hsv, np.array([0, 0, 160]), np.array([180, 70, 255]))
+            if np.count_nonzero(bright) > (w * h * 0.01):
+                ys, xs = np.where(bright > 0)
+                blade_points = np.stack([xs + x, ys + y], axis=1)
+                blade_proj = blade_points @ axis
+                front_blade = blade_points[int(np.argmax(blade_proj))]
+
+        # Blend robustly between geometric and shiny-blade cues.
+        front = np.round(0.6 * front_geom + 0.4 * front_blade).astype(int)
+        heading_deg = float(np.degrees(np.arctan2(axis[1], axis[0])))
+        return (int(front[0]), int(front[1])), heading_deg
+
     def detect_robots(self, frame: np.ndarray) -> List[Dict]:
         """
         Detect robot candidates in frame
@@ -65,24 +110,29 @@ class RobotTracker:
         mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         cv2.circle(mask, self.dohyo_center, self.dohyo_radius, 255, -1)
         
-        # Convert to HSV for better color separation
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        
-        # Detect dark objects (robots are typically darker than dohyo)
-        # Adaptive threshold to handle lighting variations
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Detect darker structure and moving objects (handles bright robots too)
         _, dark_thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        motion_mask = np.zeros_like(gray)
+        if self.prev_gray is not None:
+            diff = cv2.absdiff(gray, self.prev_gray)
+            _, motion_mask = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
+        self.prev_gray = gray
+
+        combined = cv2.bitwise_or(dark_thresh, motion_mask)
         
         # Apply morphology to clean up
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        dark_thresh = cv2.morphologyEx(dark_thresh, cv2.MORPH_CLOSE, kernel)
-        dark_thresh = cv2.morphologyEx(dark_thresh, cv2.MORPH_OPEN, kernel)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
         
         # Mask to dohyo area only
-        dark_thresh = cv2.bitwise_and(dark_thresh, mask)
+        combined = cv2.bitwise_and(combined, mask)
         
         # Find contours
-        contours, _ = cv2.findContours(dark_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         detections = []
         for contour in contours:
@@ -121,13 +171,20 @@ class RobotTracker:
             hist = cv2.calcHist([hsv], [0, 1], roi_mask, [30, 32], [0, 180, 0, 256])
             hist = cv2.normalize(hist, hist).flatten()
             
+            front_point, heading_deg = self._estimate_front_point(frame, contour, (cx, cy))
+
             detections.append({
                 'position': (cx, cy),
                 'bbox': (x, y, w, h),
                 'area': area,
                 'contour': contour,
-                'color_histogram': hist
+                'color_histogram': hist,
+                'front_point': front_point,
+                'heading_deg': heading_deg,
             })
+
+        detections.sort(key=lambda d: d['area'], reverse=True)
+        detections = detections[:self.max_track_count]
         
         return detections
     
@@ -213,6 +270,17 @@ class RobotTracker:
         # Match detections to existing tracks
         matched_pairs, unmatched_det, unmatched_tracks = \
             self.match_detections_to_tracks(detections)
+
+        # Occlusion handling: one merged contour while we expect two robots.
+        if len(detections) == 1 and len(self.robots) >= 2:
+            for robot in self.robots.values():
+                robot.frames_lost += 1
+                robot.occluded = True
+                robot.confidence = max(0.2, robot.confidence - 0.08)
+                pred_x = robot.position[0] + robot.velocity[0]
+                pred_y = robot.position[1] + robot.velocity[1]
+                robot.position = (int(pred_x), int(pred_y))
+            return self.robots
         
         # Update matched tracks
         for robot_id, det_idx in matched_pairs:
@@ -232,6 +300,9 @@ class RobotTracker:
             robot.velocity = (vx, vy)
             robot.bbox = detection['bbox']
             robot.position_history.append(new_pos)
+            robot.front_point = detection['front_point']
+            robot.heading_deg = detection['heading_deg']
+            robot.occluded = False
             robot.frames_tracked += 1
             robot.frames_lost = 0
             robot.confidence = min(1.0, robot.confidence + 0.1)
@@ -244,6 +315,7 @@ class RobotTracker:
         for robot_id in unmatched_tracks:
             robot = self.robots[robot_id]
             robot.frames_lost += 1
+            robot.occluded = True
             robot.confidence = max(0.0, robot.confidence - 0.2)
             
             # Predict position using velocity
@@ -269,7 +341,10 @@ class RobotTracker:
                 frames_lost=0,
                 bbox=detection['bbox'],
                 position_history=deque([detection['position']], 
-                                      maxlen=self.position_history_size)
+                                      maxlen=self.position_history_size),
+                front_point=detection['front_point'],
+                heading_deg=detection['heading_deg'],
+                occluded=False,
             )
             
             self.robots[self.next_id] = new_robot
@@ -317,9 +392,14 @@ class RobotTracker:
             
             # Draw ID
             if show_ids:
-                cv2.putText(result, f"R{robot_id}", 
+                occ = " OCC" if robot.occluded else ""
+                cv2.putText(result, f"R{robot_id}{occ}", 
                            (robot.position[0] - 10, robot.position[1] - 15),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            # Front indicator and heading vector
+            cv2.circle(result, robot.front_point, 4, (255, 255, 0), -1)
+            cv2.line(result, robot.position, robot.front_point, (255, 255, 0), 2)
             
             # Draw velocity vector
             if np.linalg.norm(robot.velocity) > 1:

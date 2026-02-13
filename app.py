@@ -124,7 +124,6 @@ with tab1:
             with st.spinner("Processing video... This may take 30-60 seconds"):
                 try:
                     # Import processing modules
-                    from models.detector import RobotDetector
                     from models.dohyo import DohyoDetector
                     from models.homography import HomographyTransform
                     from tracking.tracker import RobotTracker
@@ -136,7 +135,6 @@ with tab1:
                     
                     # Step 1: Initialize detectors
                     status_text.text("Initializing models...")
-                    detector = RobotDetector(confidence=confidence_threshold)
                     dohyo_detector = DohyoDetector()
                     progress_bar.progress(10)
                     
@@ -208,9 +206,6 @@ with tab1:
                                 if not ret:
                                     break
                                 
-                                # Detect robots
-                                detections = detector.detect(frame)
-                                
                                 # Track robots
                                 robots_dict = tracker.update(frame)  # Dict[int, RobotState]
 
@@ -225,16 +220,19 @@ with tab1:
                                 candidates.sort(key=lambda x: x[1].confidence, reverse=True)
                                 top_robots = dict(candidates[:2])
 
-                                # Convert to list of dicts for compatibility
+                                # Convert to list of dicts for compatibility (max 2 active robots)
                                 tracked_robots = []
-                                for robot_id, robot_state in robots_dict.items():
+                                for robot_id, robot_state in top_robots.items():
                                     robot_dict = {
                                         "id": robot_id,
-                                        "center": robot_state.position,  # RobotState.position is tuple (x, y)
+                                        "center": robot_state.position,
                                         "bbox": robot_state.bbox,
                                         "velocity": robot_state.velocity,
                                         "confidence": robot_state.confidence,
-                                        "top_down_pos": None,  # Will be filled
+                                        "front_point": robot_state.front_point,
+                                        "heading_deg": robot_state.heading_deg,
+                                        "occluded": robot_state.occluded,
+                                        "top_down_pos": None,
                                     }
                                     tracked_robots.append(robot_dict)
 
@@ -258,12 +256,19 @@ with tab1:
                                     
                                     # Draw robots
                                     for robot in tracked_robots:
+                                        color = (0, 255, 255) if robot.get("occluded") else (0, 255, 0)
                                         cv2.rectangle(vis_frame, 
                                                     (robot["bbox"][0], robot["bbox"][1]), 
                                                     (robot["bbox"][0] + robot["bbox"][2], robot["bbox"][1] + robot["bbox"][3]), 
-                                                    (0, 255, 0), 2)
+                                                    color, 2)
                                         cv2.circle(vis_frame, robot["center"], 8, (0, 0, 255), -1)
-                                        cv2.putText(vis_frame, f"R{robot['id']}:{robot['confidence']:.1f}", 
+                                        if robot.get("front_point"):
+                                            cv2.circle(vis_frame, robot["front_point"], 4, (255, 255, 0), -1)
+                                            cv2.line(vis_frame, robot["center"], robot["front_point"], (255, 255, 0), 2)
+                                        label = f"R{robot['id']}:{robot['confidence']:.1f}"
+                                        if robot.get("occluded"):
+                                            label += " OCC"
+                                        cv2.putText(vis_frame, label, 
                                                 (robot["center"][0]-30, robot["center"][1]-10),
                                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                                     
