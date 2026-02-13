@@ -19,11 +19,14 @@ if "track_rows" not in st.session_state:
     st.session_state.track_rows = []
 
 st.title("🤖 Robot Sumo Match Analyzer")
-st.caption("Current scope: per-frame dohyo tracking + robust 2-robot bounding boxes + annotated output video.")
+st.caption("Current scope: per-frame dohyo tracking + AI-assisted two-robot tracking + annotated output video.")
 
 with st.sidebar:
     st.header("⚙️ Processing")
     min_confidence = st.slider("Minimum confidence to display", 0.0, 1.0, 0.25, 0.05)
+    use_ai_detector = st.checkbox("Use AI robot detector (recommended)", value=True)
+    ai_weights_path = st.text_input("AI weights path (.pt)", value="models/weights/robot_sumo.pt")
+    ai_confidence = st.slider("AI confidence", 0.05, 0.95, 0.20, 0.05)
 
 uploaded_file = st.file_uploader("Choose match video", type=["mp4", "avi", "mov", "mkv"])
 
@@ -64,7 +67,15 @@ if uploaded_file is not None:
                 st.error("Could not detect dohyo edges.")
                 cap.release()
             else:
-                tracker = RobotTracker()
+                tracker = RobotTracker(
+                    ai_weights_path=ai_weights_path if use_ai_detector else None,
+                    ai_confidence=ai_confidence,
+                )
+                if use_ai_detector:
+                    if tracker.ai_enabled:
+                        st.info(f"AI detector loaded: {ai_weights_path}")
+                    else:
+                        st.warning("AI detector unavailable (missing weights/deps). Falling back to classical CV.")
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
                 out_path = tempfile.NamedTemporaryFile(delete=False, suffix="_annotated.mp4").name

@@ -14,6 +14,8 @@ from typing import Deque, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from models.robot_ai_detector import AIRobotDetector
+
 
 @dataclass
 class RobotState:
@@ -33,7 +35,7 @@ class RobotState:
 class RobotTracker:
     """Hybrid detector-tracker on canonical top-down dohyo space."""
 
-    def __init__(self, max_lost_frames: int = 20):
+    def __init__(self, max_lost_frames: int = 20, ai_weights_path: Optional[str] = None, ai_confidence: float = 0.2):
         self.max_lost_frames = max_lost_frames
         self.frame_idx = 0
 
@@ -55,6 +57,12 @@ class RobotTracker:
 
         # light Kalman filters for center smoothing/prediction
         self.kalman: Dict[int, cv2.KalmanFilter] = {}
+
+        self.ai_detector = None
+        self.ai_enabled = False
+        if ai_weights_path:
+            self.ai_detector = AIRobotDetector(ai_weights_path, conf=ai_confidence, class_id=None)
+            self.ai_enabled = bool(self.ai_detector.ready)
 
     @staticmethod
     def _ellipse_four_points(center: Tuple[float, float], axes: Tuple[float, float], angle_deg: float) -> np.ndarray:
@@ -91,82 +99,123 @@ class RobotTracker:
         hsv = cv2.cvtColor(norm_frame, cv2.COLOR_BGR2HSV)
         mask = self._make_ring_mask()
 
-        # 1) background subtraction catches motion (fast robots)
-        if self.bg_norm is None:
-            self.bg_norm = gray.astype(np.float32)
-        cv2.accumulateWeighted(gray, self.bg_norm, 0.02)
-        bg = cv2.convertScaleAbs(self.bg_norm)
-        bg_diff = cv2.absdiff(gray, bg)
-        _, m_bg = cv2.threshold(bg_diff, 14, 255, cv2.THRESH_BINARY)
-
-        # 2) frame-to-frame motion catches fast bursts
-        m_ff = np.zeros_like(gray)
-        if self.prev_norm_gray is not None:
-            d = cv2.absdiff(gray, self.prev_norm_gray)
-            _, m_ff = cv2.threshold(d, 10, 255, cv2.THRESH_BINARY)
-        self.prev_norm_gray = gray
-
-        # 3) static robot cue on gray dohyo: dark + textured compact objects
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, m_dark = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        edges = cv2.Canny(gray, 70, 170)
-
-        fused = cv2.bitwise_or(m_bg, m_ff)
-        fused = cv2.bitwise_or(fused, m_dark)
-        fused = cv2.bitwise_or(fused, edges)
-        fused = cv2.bitwise_and(fused, mask)
-
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        fused = cv2.morphologyEx(fused, cv2.MORPH_OPEN, k)
-        fused = cv2.morphologyEx(fused, cv2.MORPH_CLOSE, k)
-
-        contours, _ = cv2.findContours(fused, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        min_area = self.robot_area_expected * 0.25
-        max_area = self.robot_area_expected * 3.5
-
         cands: List[Dict] = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < min_area or area > max_area:
-                continue
 
-            x, y, w, h = cv2.boundingRect(cnt)
-            if w < 8 or h < 8:
-                continue
+        # AI-first path (works for standing robots too, no motion needed).
+        if self.ai_enabled and self.ai_detector is not None:
+            ai_raw = self.ai_detector.detect(norm_frame, max_det=6)
+            for d in ai_raw:
+                x, y, w, h = d["bbox_norm"]
+                cx, cy = d["center_norm"]
+                if mask[cy, cx] == 0:
+                    continue
+                roi_mask = np.zeros(gray.shape, dtype=np.uint8)
+                cv2.rectangle(roi_mask, (x, y), (x + w, y + h), 255, -1)
+                hist = cv2.calcHist([hsv], [0, 1], roi_mask, [24, 24], [0, 180, 0, 256])
+                hist = cv2.normalize(hist, hist).flatten()
 
-            ar = w / float(h)
-            if ar < 0.3 or ar > 3.5:
-                continue
+                rect_cnt = np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.int32).reshape(-1, 1, 2)
+                front_norm, heading = self._estimate_front(norm_frame, rect_cnt, (cx, cy))
 
-            m = cv2.moments(cnt)
-            if m["m00"] == 0:
-                continue
-            cx = int(m["m10"] / m["m00"])
-            cy = int(m["m01"] / m["m00"])
-
-            # simple appearance descriptor (helps ID stability)
-            roi_mask = np.zeros(gray.shape, dtype=np.uint8)
-            cv2.drawContours(roi_mask, [cnt], -1, 255, -1)
-            hist = cv2.calcHist([hsv], [0, 1], roi_mask, [24, 24], [0, 180, 0, 256])
-            hist = cv2.normalize(hist, hist).flatten()
-
-            # front hint from geometry + shiny blade cue
-            front_norm, heading = self._estimate_front(norm_frame, cnt, (cx, cy))
-
-            cands.append(
-                {
+                cands.append({
                     "center_norm": (cx, cy),
                     "bbox_norm": (x, y, w, h),
-                    "area": area,
+                    "area": float(w * h),
                     "hist": hist,
                     "front_norm": front_norm,
                     "heading_deg": heading,
-                }
-            )
+                    "ai_conf": d.get("ai_confidence", 0.0),
+                })
 
-        cands.sort(key=lambda z: z["area"], reverse=True)
-        return cands[:6]
+        # classical fallback or fusion (adds robustness when AI misses)
+        if len(cands) < 2:
+            # 1) background subtraction catches motion (fast robots)
+            if self.bg_norm is None:
+                self.bg_norm = gray.astype(np.float32)
+            cv2.accumulateWeighted(gray, self.bg_norm, 0.02)
+            bg = cv2.convertScaleAbs(self.bg_norm)
+            bg_diff = cv2.absdiff(gray, bg)
+            _, m_bg = cv2.threshold(bg_diff, 14, 255, cv2.THRESH_BINARY)
+
+            # 2) frame-to-frame motion catches fast bursts
+            m_ff = np.zeros_like(gray)
+            if self.prev_norm_gray is not None:
+                d = cv2.absdiff(gray, self.prev_norm_gray)
+                _, m_ff = cv2.threshold(d, 10, 255, cv2.THRESH_BINARY)
+            self.prev_norm_gray = gray
+
+            # 3) static robot cue on gray dohyo: dark + textured compact objects
+            blur = cv2.GaussianBlur(gray, (5, 5), 0)
+            _, m_dark = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            edges = cv2.Canny(gray, 70, 170)
+
+            fused = cv2.bitwise_or(m_bg, m_ff)
+            fused = cv2.bitwise_or(fused, m_dark)
+            fused = cv2.bitwise_or(fused, edges)
+            fused = cv2.bitwise_and(fused, mask)
+
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            fused = cv2.morphologyEx(fused, cv2.MORPH_OPEN, k)
+            fused = cv2.morphologyEx(fused, cv2.MORPH_CLOSE, k)
+
+            contours, _ = cv2.findContours(fused, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            min_area = self.robot_area_expected * 0.25
+            max_area = self.robot_area_expected * 3.5
+
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < min_area or area > max_area:
+                    continue
+
+                x, y, w, h = cv2.boundingRect(cnt)
+                if w < 8 or h < 8:
+                    continue
+
+                ar = w / float(h)
+                if ar < 0.3 or ar > 3.5:
+                    continue
+
+                m = cv2.moments(cnt)
+                if m["m00"] == 0:
+                    continue
+                cx = int(m["m10"] / m["m00"])
+                cy = int(m["m01"] / m["m00"])
+
+                roi_mask = np.zeros(gray.shape, dtype=np.uint8)
+                cv2.drawContours(roi_mask, [cnt], -1, 255, -1)
+                hist = cv2.calcHist([hsv], [0, 1], roi_mask, [24, 24], [0, 180, 0, 256])
+                hist = cv2.normalize(hist, hist).flatten()
+
+                front_norm, heading = self._estimate_front(norm_frame, cnt, (cx, cy))
+
+                cands.append(
+                    {
+                        "center_norm": (cx, cy),
+                        "bbox_norm": (x, y, w, h),
+                        "area": area,
+                        "hist": hist,
+                        "front_norm": front_norm,
+                        "heading_deg": heading,
+                        "ai_conf": 0.0,
+                    }
+                )
+
+        cands.sort(key=lambda z: (z.get("ai_conf", 0.0), z["area"]), reverse=True)
+
+        # remove near-duplicate boxes
+        filtered = []
+        for c in cands:
+            cx, cy = c["center_norm"]
+            keep = True
+            for e in filtered:
+                ex, ey = e["center_norm"]
+                if np.hypot(cx - ex, cy - ey) < 20:
+                    keep = False
+                    break
+            if keep:
+                filtered.append(c)
+        return filtered[:6]
 
     def _estimate_front(self, norm_frame: np.ndarray, contour: np.ndarray, center: Tuple[int, int]) -> Tuple[Tuple[int, int], float]:
         rect = cv2.minAreaRect(contour)
