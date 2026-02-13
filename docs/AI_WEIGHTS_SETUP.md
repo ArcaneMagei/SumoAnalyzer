@@ -67,3 +67,18 @@ python scripts/validate_robot_detector.py \
 ## Practical recommendation
 
 Start with 300–600 labeled frames from your own footage, then add hard examples (collisions, occlusions, scratches, reflections). This dramatically improves stationary robot detection.
+
+
+## Manual annotation helper (recommended)
+
+If you are not sure how to annotate by hand, use:
+
+```bash
+python scripts/annotate_robot_dataset.py --help
+```
+
+Detailed walkthrough is in:
+
+```text
+docs/ANNOTATION_GUIDE.md
+```
