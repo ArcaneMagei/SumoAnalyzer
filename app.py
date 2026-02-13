@@ -19,12 +19,11 @@ if "track_rows" not in st.session_state:
     st.session_state.track_rows = []
 
 st.title("🤖 Robot Sumo Match Analyzer")
-st.caption("Current scope: robust dohyo + two-robot + blade/front tracking with annotated output video.")
+st.caption("Current scope: per-frame dohyo tracking + robust 2-robot bounding boxes + annotated output video.")
 
 with st.sidebar:
     st.header("⚙️ Processing")
     min_confidence = st.slider("Minimum confidence to display", 0.0, 1.0, 0.25, 0.05)
-    draw_trails = st.checkbox("Draw trails", value=True)
 
 uploaded_file = st.file_uploader("Choose match video", type=["mp4", "avi", "mov", "mkv"])
 
@@ -58,14 +57,14 @@ if uploaded_file is not None:
             st.error("Could not read video.")
             cap.release()
         else:
-            status.text("Detecting dohyo...")
+            status.text("Detecting and tracking dohyo...")
             dohyo = DohyoDetector()
             center, radius = dohyo.detect(first)
             if center is None or radius is None:
                 st.error("Could not detect dohyo edges.")
                 cap.release()
             else:
-                tracker = RobotTracker(dohyo_center=center, dohyo_radius=radius)
+                tracker = RobotTracker()
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
                 out_path = tempfile.NamedTemporaryFile(delete=False, suffix="_annotated.mp4").name
@@ -76,36 +75,34 @@ if uploaded_file is not None:
                 frame_idx = 0
                 preview_slot = st.empty()
 
-                status.text("Tracking robots and blade/front point...")
                 while True:
                     ret, frame = cap.read()
                     if not ret:
                         break
 
-                    tracks = tracker.update(frame)
-                    annotated = tracker.draw_tracks(frame)
+                    # Update dohyo per-frame to handle camera movement and perspective changes.
+                    d_center, d_radius = dohyo.track(frame)
+                    if d_center is None or d_radius is None or dohyo.last_detection_info is None:
+                        annotated = frame.copy()
+                        cv2.putText(annotated, "DOHYO LOST", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                        writer.write(annotated)
+                        frame_idx += 1
+                        continue
 
-                    # Optional hide low confidence labels from exported visualization.
+                    tracks = tracker.update(frame, dohyo.last_detection_info)
+
+                    # Draw dohyo references first: outer edge, white border inner edge, center cross
+                    annotated = dohyo.draw_overlay(frame)
+                    # Draw robots
+                    tracks_vis = tracker.draw_tracks(annotated)
+                    annotated = tracks_vis
+
+                    # De-emphasize low-confidence boxes in final export.
                     if min_confidence > 0:
                         for rid, state in tracks.items():
                             if state.confidence < min_confidence:
                                 x, y, w, h = state.bbox
-                                cv2.rectangle(annotated, (x, y), (x + w, y + h), (90, 90, 90), 1)
-
-                    if not draw_trails:
-                        # redraw without trails quickly by drawing current only
-                        annotated = frame.copy()
-                        cv2.circle(annotated, center, radius, (0, 255, 0), 3)
-                        for rid, state in tracks.items():
-                            if state.confidence < min_confidence:
-                                continue
-                            x, y, w, h = state.bbox
-                            color = (0, 255, 255) if state.occluded else (0, 255, 0)
-                            cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
-                            cv2.circle(annotated, state.position, 5, (0, 0, 255), -1)
-                            cv2.circle(annotated, state.front_point, 4, (255, 255, 0), -1)
-                            cv2.line(annotated, state.position, state.front_point, (255, 255, 0), 2)
-                            cv2.putText(annotated, f"R{rid} {state.confidence:.2f}", (state.position[0]-30, state.position[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                                cv2.rectangle(annotated, (x, y), (x + w, y + h), (110, 110, 110), 1)
 
                     writer.write(annotated)
 
@@ -118,13 +115,13 @@ if uploaded_file is not None:
                                 "frame": frame_idx,
                                 "time_s": frame_idx / (fps if fps > 0 else 30.0),
                                 "robot_id": rid,
-                                "x": state.position[0],
-                                "y": state.position[1],
-                                "front_x": state.front_point[0],
-                                "front_y": state.front_point[1],
-                                "heading_deg": state.heading_deg,
+                                "bbox_x": state.bbox[0],
+                                "bbox_y": state.bbox[1],
+                                "bbox_w": state.bbox[2],
+                                "bbox_h": state.bbox[3],
                                 "confidence": state.confidence,
-                                "occluded": state.occluded,
+                                "dohyo_center_x": dohyo.last_detection_info["center"][0],
+                                "dohyo_center_y": dohyo.last_detection_info["center"][1],
                             }
                         )
 
