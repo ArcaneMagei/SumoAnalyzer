@@ -1,0 +1,44 @@
+# Docker Compose for NVIDIA GPU machines (RTX 4090 Windows PC)
+# Use: docker compose -f docker-compose.gpu.yml up
+
+version: '3.8'
+
+services:
+  sumo-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sumo-analyzer:latest
+    container_name: sumo-analyzer
+    
+    ports:
+      - "8501:8501"
+    
+    volumes:
+      - ./data/input:/app/data/input
+      - ./data/output:/app/data/output
+      - ./logs:/app/logs
+      - ./models/weights:/app/models/weights
+    
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      - CUDA_VISIBLE_DEVICES=0
+    
+    # NVIDIA GPU support enabled
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

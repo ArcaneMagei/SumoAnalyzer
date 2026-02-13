@@ -1,0 +1,48 @@
+# Docker Compose configuration for Robot Sumo Analyzer
+# Universal: Works on Windows (with/without GPU), macOS, Linux
+
+version: '3.8'
+
+services:
+  sumo-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile.ubuntu
+    image: sumo-analyzer:latest
+    container_name: sumo-analyzer
+    
+    ports:
+      - "8501:8501"
+    
+    volumes:
+      # Mount data directories (persists on host machine)
+      - ./data/input:/app/data/input
+      - ./data/output:/app/data/output
+      - ./logs:/app/logs
+      # Cache model weights
+      - ./models/weights:/app/models/weights
+    
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      # Auto-detect device: CUDA (NVIDIA), MPS (Apple), or CPU
+      - PYTORCH_ENABLE_MPS_FALLBACK=1
+    
+    # GPU support disabled for CPU-only machines
+    # Uncomment the deploy section below ONLY if you have NVIDIA GPU
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

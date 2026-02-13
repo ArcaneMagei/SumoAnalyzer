@@ -1,0 +1,53 @@
+# Fixed Dockerfile for Ubuntu base
+# Resolves apt-get exit code 100 by using reliable mirrors
+
+FROM ubuntu:22.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Set working directory
+WORKDIR /app
+
+# Fix apt sources and install system dependencies
+# Split into separate steps for better error diagnosis
+RUN apt-get update || (rm -rf /var/lib/apt/lists/* && apt-get update)
+
+RUN apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        python3-dev \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender-dev \
+        libgomp1 \
+        libgstreamer1.0-0 \
+        libgstreamer-plugins-base1.0-0 \
+        ffmpeg \
+        curl \
+        wget \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip
+RUN python3 -m pip install --upgrade pip
+
+# Copy requirements first (for better caching)
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create directories for uploads and results
+RUN mkdir -p /app/uploads /app/results /app/data
+
+# Expose port
+EXPOSE 5000
+
+# Run the application
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]

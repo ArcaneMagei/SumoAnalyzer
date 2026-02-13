@@ -1,0 +1,77 @@
+# .dockerignore - Files to exclude from Docker build context
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Data directories (use volumes instead)
+data/input/*
+!data/input/.gitkeep
+data/output/*
+!data/output/.gitkeep
+
+# Model weights (downloaded on first run)
+models/weights/*.pt
+!models/weights/.gitkeep
+
+# Logs
+logs/*.log
+!logs/.gitkeep
+
+# Database
+database/*.db
+database/*.db-journal
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Documentation (except README)
+*.md
+!README.md
+
+# Test files
+tests/
+test_*.py
+*_test.py
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Docker files (don't need in container)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Other
+*.bak
+*.tmp
+*.temp
+.env
+.env.local
