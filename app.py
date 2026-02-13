@@ -75,7 +75,7 @@ if uploaded_file is not None:
                     if tracker.ai_enabled:
                         st.info(f"AI detector loaded: {ai_weights_path}")
                     else:
-                        st.warning("AI detector unavailable (missing weights/deps). Falling back to classical CV.")
+                        st.warning("AI detector unavailable (missing weights/deps). Falling back to classical CV. See docs/AI_WEIGHTS_SETUP.md for full setup.")
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
                 out_path = tempfile.NamedTemporaryFile(delete=False, suffix="_annotated.mp4").name
