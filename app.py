@@ -101,7 +101,7 @@ if uploaded_file is not None:
                     if min_confidence > 0:
                         for rid, state in tracks.items():
                             if state.confidence < min_confidence:
-                                x, y, w, h = state.bbox
+                                x, y, w, h = state.bbox_img
                                 cv2.rectangle(annotated, (x, y), (x + w, y + h), (110, 110, 110), 1)
 
                     writer.write(annotated)
@@ -115,10 +115,17 @@ if uploaded_file is not None:
                                 "frame": frame_idx,
                                 "time_s": frame_idx / (fps if fps > 0 else 30.0),
                                 "robot_id": rid,
-                                "bbox_x": state.bbox[0],
-                                "bbox_y": state.bbox[1],
-                                "bbox_w": state.bbox[2],
-                                "bbox_h": state.bbox[3],
+                                "bbox_x": state.bbox_img[0],
+                                "bbox_y": state.bbox_img[1],
+                                "bbox_w": state.bbox_img[2],
+                                "bbox_h": state.bbox_img[3],
+                                "center_x": state.center_img[0],
+                                "center_y": state.center_img[1],
+                                "front_x": state.front_img[0],
+                                "front_y": state.front_img[1],
+                                "heading_deg": state.heading_deg,
+                                "in_dohyo": state.in_dohyo,
+                                "eliminated": state.eliminated,
                                 "confidence": state.confidence,
                                 "dohyo_center_x": dohyo.last_detection_info["center"][0],
                                 "dohyo_center_y": dohyo.last_detection_info["center"][1],
