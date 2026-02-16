@@ -1,23 +1,15 @@
-"""Robot Sumo Training Studio (all-in-one local app).
-
-Single tool for:
-1) Trim action clips
-2) Extract labeling frames
-3) Annotate robot + blade geometry
-4) Export YOLO labels
-5) Train detector
-6) Test model on new videos
-"""
+"""Robot Sumo Training Studio (all-in-one local app)."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 
 def require_cv2():
@@ -27,6 +19,77 @@ def require_cv2():
         return cv2
     except Exception as e:
         raise RuntimeError("OpenCV is required: pip install opencv-python") from e
+
+
+def resolve_video_path(video_arg: str, search_roots: Optional[List[Path]] = None) -> Path:
+    """Resolve video path robustly for Windows CLI usage.
+
+    Handles relative paths, quoted paths, and searches common project folders.
+    """
+    raw = video_arg.strip().strip('"').strip("'")
+    p = Path(raw)
+
+    candidates = []
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        candidates.extend(
+            [
+                Path.cwd() / p,
+                Path.cwd() / "data" / "studio" / "raw_videos" / p.name,
+                Path.cwd() / "data" / "studio" / "clips" / p.name,
+                Path.cwd() / p.name,
+            ]
+        )
+        if search_roots:
+            for root in search_roots:
+                candidates.append(root / p.name)
+
+    for c in candidates:
+        if c.exists():
+            return c.resolve()
+
+    raise FileNotFoundError(
+        "Could not find video. Tried:\n" + "\n".join(str(c) for c in candidates)
+    )
+
+
+def ensure_dirs(base: Path) -> None:
+    for p in [base / "clips", base / "frames", base / "annotations", base / "exports", base / "raw_videos"]:
+        p.mkdir(parents=True, exist_ok=True)
+
+
+def open_video_capture(video: Path):
+    cv2 = require_cv2()
+    cap = cv2.VideoCapture(str(video))
+    if cap.isOpened():
+        return cap, None
+
+    msg = [
+        f"OpenCV failed to open video: {video}",
+        "Possible causes:",
+        "  - wrong path/working directory",
+        "  - MOV codec unsupported in this OpenCV build",
+        "  - corrupted video",
+    ]
+    ffmpeg = shutil_which("ffmpeg")
+    if ffmpeg:
+        msg.append("Try transcoding first:")
+        msg.append(f"  ffmpeg -y -i \"{video}\" -c:v libx264 -pix_fmt yuv420p -c:a aac \"{video.with_suffix('.mp4')}\"")
+    return cap, "\n".join(msg)
+
+
+def shutil_which(cmd: str) -> Optional[str]:
+    paths = os.environ.get("PATH", "").split(os.pathsep)
+    exts = [""]
+    if os.name == "nt":
+        exts += [".exe", ".bat", ".cmd"]
+    for d in paths:
+        for e in exts:
+            p = Path(d) / f"{cmd}{e}"
+            if p.exists() and p.is_file():
+                return str(p)
+    return None
 
 
 @dataclass
@@ -57,16 +120,11 @@ def _heading_deg(center: Tuple[int, int], front: Tuple[int, int]) -> float:
     return float(math.degrees(math.atan2(front[1] - center[1], front[0] - center[0])))
 
 
-def ensure_dirs(base: Path) -> None:
-    for p in [base / "clips", base / "frames", base / "annotations", base / "exports"]:
-        p.mkdir(parents=True, exist_ok=True)
-
-
 def trim_video(video: Path, out_clip: Path) -> int:
     cv2 = require_cv2()
-    cap = cv2.VideoCapture(str(video))
+    cap, err = open_video_capture(video)
     if not cap.isOpened():
-        print(f"Could not open: {video}")
+        print(err)
         return 2
 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -139,9 +197,9 @@ def extract_frames(video: Path, out_dir: Path, fps_out: float = 8.0) -> int:
     cv2 = require_cv2()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cap = cv2.VideoCapture(str(video))
+    cap, err = open_video_capture(video)
     if not cap.isOpened():
-        print(f"Could not open: {video}")
+        print(err)
         return 2
 
     fps_in = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
@@ -200,7 +258,6 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
     print("Annotate controls: ROI Enter confirm / ESC skip; review n=save r=redo q=quit")
     print("For each robot you will pick: bbox -> blade LEFT point -> blade RIGHT point")
 
-    saved = 0
     for i, img_path in enumerate(imgs[start_index:], start=start_index):
         frame = cv2.imread(str(img_path))
         if frame is None:
@@ -268,7 +325,6 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
         rec = FrameLabel(image_name=img_path.name, width=w, height=h, robots=labels)
         outp = out_json_dir / f"{img_path.stem}.json"
         outp.write_text(json.dumps(asdict(rec), indent=2), encoding="utf-8")
-        saved += 1
         print(f"[{i+1}/{len(imgs)}] saved {outp.name}")
 
     cv2.destroyAllWindows()
@@ -351,7 +407,11 @@ def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, 
         return 2
 
     model = YOLO(str(weights))
-    cap = cv2.VideoCapture(str(video))
+    cap, err = open_video_capture(video)
+    if not cap.isOpened():
+        print(err)
+        return 3
+
     ok, frame = cap.read()
     if not ok:
         print("Could not open video")
@@ -455,22 +515,27 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    if args.cmd == "trim":
-        return trim_video(Path(args.video), Path(args.out))
-    if args.cmd == "extract":
-        return extract_frames(Path(args.video), Path(args.out_dir), fps_out=args.fps)
-    if args.cmd == "annotate":
-        return annotate_frames(Path(args.frames_dir), Path(args.out_json_dir), start_index=args.start_index)
-    if args.cmd == "export-yolo":
-        return export_yolo_from_json(
-            Path(args.frames_dir), Path(args.json_dir), Path(args.labels_out), blade_box_thickness_px=args.blade_box_thickness_px
-        )
-    if args.cmd == "train":
-        return run_training(
-            Path(args.dataset_dir), args.model, args.epochs, args.imgsz, args.batch, args.device, args.workers
-        )
-    if args.cmd == "infer-video":
-        return infer_video(Path(args.weights), Path(args.video), Path(args.out), conf=args.conf, imgsz=args.imgsz)
+    try:
+        if args.cmd == "trim":
+            v = resolve_video_path(args.video)
+            return trim_video(v, Path(args.out))
+        if args.cmd == "extract":
+            v = resolve_video_path(args.video)
+            return extract_frames(v, Path(args.out_dir), fps_out=args.fps)
+        if args.cmd == "annotate":
+            return annotate_frames(Path(args.frames_dir), Path(args.out_json_dir), start_index=args.start_index)
+        if args.cmd == "export-yolo":
+            return export_yolo_from_json(
+                Path(args.frames_dir), Path(args.json_dir), Path(args.labels_out), blade_box_thickness_px=args.blade_box_thickness_px
+            )
+        if args.cmd == "train":
+            return run_training(Path(args.dataset_dir), args.model, args.epochs, args.imgsz, args.batch, args.device, args.workers)
+        if args.cmd == "infer-video":
+            v = resolve_video_path(args.video)
+            return infer_video(Path(args.weights), v, Path(args.out), conf=args.conf, imgsz=args.imgsz)
+    except FileNotFoundError as e:
+        print(e)
+        return 2
 
     return 1
 

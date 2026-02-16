@@ -1,118 +1,46 @@
-# Robot Sumo Annotation Guide (Beginner Friendly)
+# Robot Sumo Annotation Guide (UI-first)
 
-Goal: produce high-quality labels for:
-- robot localization,
-- blade orientation (most important).
-
-This guide uses the unified tool:
+## Start app
 
 ```bash
-python scripts/training_studio.py --help
+python scripts/training_studio_ui.py
 ```
 
----
+## Workflow in UI
 
-## 1) Prepare action clip and frames
+1. Add videos (file picker), set current video.
+2. Click **Trim clip** and mark IN/OUT around action.
+3. Click **Extract frames**.
+4. Click **Annotate**:
+   - For each robot: draw bbox,
+   - click blade LEFT endpoint,
+   - click blade RIGHT endpoint.
+5. Click **Export YOLO labels**.
+6. Click **Train model**.
+7. Click **Test on video** (Infer) and inspect output MP4.
+
+## Why blade endpoints?
+
+Endpoints provide stronger supervision than a single point:
+- true front line direction,
+- blade width signal,
+- more stable under rotation/occlusion.
+
+## Quality checklist
+
+- Tight robot bbox around chassis/extensions.
+- Blade endpoints match actual blade contact edge.
+- Do not invent hidden shape during occlusions.
+- Include hard frames: blur, collisions, reflections, scratches.
+
+## If video won’t open
+
+Use absolute path or transcode MOV to MP4:
 
 ```bash
-python scripts/training_studio.py trim --video /path/full_match.mov --out data/studio/clips/m1.mp4
-python scripts/training_studio.py extract --video data/studio/clips/m1.mp4 --out-dir data/studio/frames --fps 10
+ffmpeg -y -i "input.mov" -c:v libx264 -pix_fmt yuv420p -c:a aac "input.mp4"
 ```
 
----
+## If training fails early
 
-## 2) Annotate frames
-
-```bash
-python scripts/training_studio.py annotate --frames-dir data/studio/frames --out-json-dir data/studio/annotations
-```
-
-For each robot (R1 then R2):
-1. Draw robot bbox (Enter confirms, ESC skips).
-2. Click **blade left endpoint**.
-3. Click **blade right endpoint**.
-4. Review and press:
-   - `n` save + next
-   - `r` redo frame
-   - `q` quit
-
-Why endpoints and not only a point?
-- better orientation learning,
-- blade width supervision,
-- stronger signal under rotation.
-
----
-
-## 3) Export YOLO labels
-
-```bash
-python scripts/training_studio.py export-yolo \
-  --frames-dir data/studio/frames \
-  --json-dir data/studio/annotations \
-  --labels-out data/robot_dataset/labels/train
-```
-
-Label classes:
-- class `0` = robot bbox
-- class `1` = blade line region (derived from endpoint segment)
-
----
-
-## 4) Quality checklist (critical)
-
-Per visible robot:
-- bbox tight around body/extensions,
-- blade endpoints match real blade width and front,
-- avoid guessing hidden geometry during occlusion.
-
-Include difficult frames:
-- collisions,
-- partial occlusion,
-- stationary start,
-- bright reflections/scratches,
-- motion blur.
-
----
-
-## 5) Train + test
-
-Train:
-
-```bash
-python scripts/training_studio.py train \
-  --dataset-dir data/robot_dataset \
-  --model yolov8n.pt \
-  --epochs 120 \
-  --imgsz 960 \
-  --batch 16 \
-  --device 0 \
-  --workers 0
-```
-
-Test on unseen video:
-
-```bash
-python scripts/training_studio.py infer-video \
-  --weights models/weights/robot_sumo.pt \
-  --video /path/unseen.mov \
-  --out artifacts/infer_unseen.mp4
-```
-
----
-
-## 6) If training fails very early
-
-Use safe debug config first:
-
-```bash
-python scripts/training_studio.py train \
-  --dataset-dir data/robot_dataset \
-  --model yolov8n.pt \
-  --epochs 10 \
-  --imgsz 640 \
-  --batch 4 \
-  --device cpu \
-  --workers 0
-```
-
-If this works, switch to GPU/full settings.
+Set in UI/CLI: `workers=0`, `device=cpu`, smaller `imgsz/batch`, then move back to GPU once stable.
