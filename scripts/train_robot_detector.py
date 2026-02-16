@@ -110,7 +110,7 @@ def main() -> int:
     parser.add_argument("--device", default="auto", help="auto, 0, 0,1, cpu, mps")
     parser.add_argument("--project", default="runs/sumo")
     parser.add_argument("--name", default="robot_detector")
-    parser.add_argument("--classes", default="robot,blade_front")
+    parser.add_argument("--classes", default="robot,blade_front,flag_left,flag_right,flag_both,blade_ext_left,blade_ext_right,blade_ext_both")
     parser.add_argument("--workers", type=int, default=0, help="Use 0 first on Windows to avoid dataloader hangs")
     parser.add_argument("--cache", action="store_true", help="Enable caching images in RAM")
     parser.add_argument("--resume", action="store_true", help="Resume interrupted run")

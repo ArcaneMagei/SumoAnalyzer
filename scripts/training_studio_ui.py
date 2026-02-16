@@ -137,7 +137,7 @@ class App(tk.Tk):
         guide_text = (
             "1) Trim clip: Use keys shown on frame: j/l +/-1, a/d +/-15, i set IN, o set OUT, s save.\n"
             "2) Extract frames: choose FPS (8-12 recommended).\n"
-            "3) Annotate: for each robot select bbox, then click blade LEFT and RIGHT endpoints.\n"
+            "3) Annotate: for each robot select bbox, click BODY center, click blade LEFT/RIGHT, then choose extension type.\n"
             "4) Export YOLO labels -> 5) Train -> 6) Test on video."
         )
         ttk.Label(guide, text=guide_text, justify="left").pack(anchor="w")
@@ -172,8 +172,10 @@ class App(tk.Tk):
             "Annotation controls",
             "Per robot:\n"
             "  1) Drag bbox + Enter\n"
-            "  2) Click blade LEFT endpoint\n"
-            "  3) Click blade RIGHT endpoint\n\n"
+            "  2) Click BODY center\n"
+            "  3) Click blade LEFT endpoint\n"
+            "  4) Click blade RIGHT endpoint\n"
+            "  5) Pick extension key: n/f/g/h/b/v/m\n\n"
             "Review window:\n"
             "  n = save + next\n"
             "  r = redo frame\n"

@@ -111,6 +111,8 @@ class RobotLabel:
     blade_mid_xy: Tuple[int, int]
     heading_deg: float
     blade_width_px: float
+    extension_type: str
+    extension_side: str
     visible: bool
 
 
@@ -256,6 +258,87 @@ def _point_picker(base_img, title: str, color=(255, 255, 0)):
     return int(pt[0]), int(pt[1])
 
 
+def _pick_extension_state(base_img, robot_id: int) -> Tuple[str, str]:
+    """Pick extension metadata for a robot.
+
+    Keys:
+      n = none
+      f/g/h = flag left/right/both
+      b/v/m = blade left/right/both
+    """
+    cv2 = require_cv2()
+    title = f"R{robot_id} extension type"
+    _named_window(title)
+
+    legend = [
+        "Select extension state:",
+        "n: none",
+        "f: flag-left  g: flag-right  h: flag-both",
+        "b: blade-left v: blade-right m: blade-both",
+    ]
+
+    while True:
+        vis = base_img.copy()
+        y = 30
+        for ln in legend:
+            cv2.putText(vis, ln, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            y += 28
+
+        cv2.imshow(title, vis)
+        key = cv2.waitKey(0) & 0xFF
+        mapping = {
+            ord("n"): ("none", "none"),
+            ord("f"): ("flag", "left"),
+            ord("g"): ("flag", "right"),
+            ord("h"): ("flag", "both"),
+            ord("b"): ("blade", "left"),
+            ord("v"): ("blade", "right"),
+            ord("m"): ("blade", "both"),
+        }
+        if key in mapping:
+            cv2.destroyWindow(title)
+            return mapping[key]
+
+
+def _extension_boxes(rb: dict, w: int, h: int) -> List[Tuple[int, int, int, int, int]]:
+    """Generate YOLO extension boxes.
+
+    Returns (cls_id, x1, y1, x2, y2)
+    class ids:
+      2: flag_left, 3: flag_right, 4: flag_both,
+      5: blade_ext_left, 6: blade_ext_right, 7: blade_ext_both
+    """
+    x1, y1, x2, y2 = [int(v) for v in rb["bbox_xyxy"]]
+    ext_type = str(rb.get("extension_type", "none")).lower()
+    ext_side = str(rb.get("extension_side", "none")).lower()
+    if ext_type not in {"flag", "blade"} or ext_side not in {"left", "right", "both"}:
+        return []
+
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    side_w = max(2, int(round(bw * 0.2)))
+
+    if ext_type == "flag":
+        y_top = max(0, y1 - int(round(bh * 0.5)))
+        y_bot = min(h - 1, y1 + int(round(bh * 0.2)))
+        cls_map = {"left": 2, "right": 3, "both": 4}
+    else:
+        y_top = max(0, y1 + int(round(bh * 0.35)))
+        y_bot = min(h - 1, y2)
+        cls_map = {"left": 5, "right": 6, "both": 7}
+
+    boxes: List[Tuple[int, int, int, int, int]] = []
+    if ext_side in {"left", "both"}:
+        lx1 = max(0, x1 - side_w)
+        lx2 = min(w - 1, x1 + side_w)
+        boxes.append((cls_map[ext_side], lx1, y_top, lx2, y_bot))
+    if ext_side in {"right", "both"}:
+        rx1 = max(0, x2 - side_w)
+        rx2 = min(w - 1, x2 + side_w)
+        boxes.append((cls_map[ext_side], rx1, y_top, rx2, y_bot))
+    return boxes
+
+
 def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) -> int:
     cv2 = require_cv2()
     imgs = sorted([*frames_dir.glob("*.jpg"), *frames_dir.glob("*.png"), *frames_dir.glob("*.jpeg")])
@@ -265,7 +348,7 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
 
     out_json_dir.mkdir(parents=True, exist_ok=True)
     print("Annotate controls: ROI Enter confirm / ESC skip; review n=save r=redo q=quit")
-    print("For each robot you will pick: bbox -> blade LEFT point -> blade RIGHT point")
+    print("For each robot you will pick: bbox -> body CENTER -> blade LEFT -> blade RIGHT -> extension state")
 
     for i, img_path in enumerate(imgs[start_index:], start=start_index):
         frame = cv2.imread(str(img_path))
@@ -285,7 +368,13 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
 
             x1, y1 = max(0, x), max(0, y)
             x2, y2 = min(w - 1, x + bw), min(h - 1, y + bh)
-            center = ((x1 + x2) // 2, (y1 + y2) // 2)
+            default_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+
+            panel_center = frame.copy()
+            cv2.rectangle(panel_center, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.circle(panel_center, default_center, 4, (0, 255, 0), -1)
+            cv2.putText(panel_center, f"R{rid}: click BODY center then key", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 255, 255), 2)
+            center = _point_picker(panel_center, f"R{rid} body-center picker", color=(0, 255, 0))
 
             panel = frame.copy()
             cv2.rectangle(panel, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -301,6 +390,7 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
             mid = ((bl[0] + br[0]) // 2, (bl[1] + br[1]) // 2)
             heading = _heading_deg(center, mid)
             blade_width = float(((br[0] - bl[0]) ** 2 + (br[1] - bl[1]) ** 2) ** 0.5)
+            ext_type, ext_side = _pick_extension_state(panel2, rid)
 
             labels.append(
                 RobotLabel(
@@ -313,6 +403,8 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
                     blade_mid_xy=mid,
                     heading_deg=heading,
                     blade_width_px=blade_width,
+                    extension_type=ext_type,
+                    extension_side=ext_side,
                     visible=True,
                 )
             )
@@ -325,7 +417,15 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
             cv2.circle(review, lb.blade_right_xy, 4, (0, 255, 255), -1)
             cv2.line(review, lb.blade_left_xy, lb.blade_right_xy, (255, 255, 0), 2)
             cv2.line(review, lb.center_xy, lb.blade_mid_xy, (255, 255, 0), 2)
-            cv2.putText(review, f"R{lb.robot_id} {lb.heading_deg:.1f}deg", (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(
+                review,
+                f"R{lb.robot_id} {lb.heading_deg:.1f}deg ext={lb.extension_type}:{lb.extension_side}",
+                (x1, max(20, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 0),
+                2,
+            )
 
         cv2.putText(review, "Review: n=save next, r=redo frame, q=quit", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
         cv2.imshow("Review (n/r/q)", review)
@@ -352,7 +452,13 @@ def xyxy_to_norm(x1: int, y1: int, x2: int, y2: int, w: int, h: int) -> Tuple[fl
     return cx / w, cy / h, bw / w, bh / h
 
 
-def export_yolo_from_json(frames_dir: Path, json_dir: Path, labels_out: Path, blade_box_thickness_px: int = 8) -> int:
+def export_yolo_from_json(
+    frames_dir: Path,
+    json_dir: Path,
+    labels_out: Path,
+    blade_box_thickness_px: int = 8,
+    include_extension_classes: bool = True,
+) -> int:
     labels_out.mkdir(parents=True, exist_ok=True)
     items = sorted(json_dir.glob("*.json"))
     if not items:
@@ -380,6 +486,11 @@ def export_yolo_from_json(frames_dir: Path, json_dir: Path, labels_out: Path, bl
             fcx, fcy, fbw, fbh = xyxy_to_norm(bx1, by1, bx2, by2, w, h)
             lines.append(f"1 {fcx:.6f} {fcy:.6f} {fbw:.6f} {fbh:.6f}")
 
+            if include_extension_classes:
+                for cls_id, ex1, ey1, ex2, ey2 in _extension_boxes(rb, w, h):
+                    ecx, ecy, ebw, ebh = xyxy_to_norm(ex1, ey1, ex2, ey2, w, h)
+                    lines.append(f"{cls_id} {ecx:.6f} {ecy:.6f} {ebw:.6f} {ebh:.6f}")
+
         out_txt = labels_out / f"{jp.stem}.txt"
         out_txt.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
         exported += 1
@@ -389,6 +500,7 @@ def export_yolo_from_json(frames_dir: Path, json_dir: Path, labels_out: Path, bl
 
 
 def run_training(dataset_dir: Path, model: str, epochs: int, imgsz: int, batch: int, device: str, workers: int) -> int:
+    classes = "robot,blade_front,flag_left,flag_right,flag_both,blade_ext_left,blade_ext_right,blade_ext_both"
     cmd = [
         sys.executable,
         "scripts/train_robot_detector.py",
@@ -406,6 +518,8 @@ def run_training(dataset_dir: Path, model: str, epochs: int, imgsz: int, batch: 
         device,
         "--workers",
         str(workers),
+        "--classes",
+        classes,
     ]
     print("Running:", " ".join(cmd))
     return subprocess.call(cmd)
@@ -538,6 +652,7 @@ def main() -> int:
     p_export.add_argument("--json-dir", required=True)
     p_export.add_argument("--labels-out", required=True)
     p_export.add_argument("--blade-box-thickness-px", type=int, default=8)
+    p_export.add_argument("--no-extension-classes", action="store_true", help="disable extension class export (2..7)")
 
     p_train = sub.add_parser("train", help="launch robust training wrapper")
     p_train.add_argument("--dataset-dir", default="data/robot_dataset")
@@ -570,7 +685,11 @@ def main() -> int:
             return annotate_frames(Path(args.frames_dir), Path(args.out_json_dir), start_index=args.start_index)
         if args.cmd == "export-yolo":
             return export_yolo_from_json(
-                Path(args.frames_dir), Path(args.json_dir), Path(args.labels_out), blade_box_thickness_px=args.blade_box_thickness_px
+                Path(args.frames_dir),
+                Path(args.json_dir),
+                Path(args.labels_out),
+                blade_box_thickness_px=args.blade_box_thickness_px,
+                include_extension_classes=not args.no_extension_classes,
             )
         if args.cmd == "train":
             return run_training(Path(args.dataset_dir), args.model, args.epochs, args.imgsz, args.batch, args.device, args.workers)
