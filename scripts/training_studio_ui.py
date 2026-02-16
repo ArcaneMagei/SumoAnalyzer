@@ -132,12 +132,53 @@ class App(tk.Tk):
             ttk.Label(train_opts, text=label).pack(side="left", padx=3)
             ttk.Entry(train_opts, textvariable=var, width=width).pack(side="left", padx=3)
 
+        guide = ttk.LabelFrame(frm, text="What to do in each step", padding=8)
+        guide.pack(fill="x", pady=6)
+        guide_text = (
+            "1) Trim clip: Use keys shown on frame: j/l +/-1, a/d +/-15, i set IN, o set OUT, s save.\n"
+            "2) Extract frames: choose FPS (8-12 recommended).\n"
+            "3) Annotate: for each robot select bbox, then click blade LEFT and RIGHT endpoints.\n"
+            "4) Export YOLO labels -> 5) Train -> 6) Test on video."
+        )
+        ttk.Label(guide, text=guide_text, justify="left").pack(anchor="w")
+
+        help_row = ttk.Frame(guide)
+        help_row.pack(fill="x", pady=4)
+        ttk.Button(help_row, text="Trim key help", command=self.show_trim_help).pack(side="left", padx=4)
+        ttk.Button(help_row, text="Annotation help", command=self.show_annot_help).pack(side="left", padx=4)
+
         logf = ttk.LabelFrame(frm, text="Log", padding=8)
         logf.pack(fill="both", expand=True, pady=6)
         self.log = tk.Text(logf, height=18)
         self.log.pack(fill="both", expand=True)
 
         ttk.Button(frm, text="Save project", command=self.save_state).pack(anchor="e", pady=6)
+
+
+    def show_trim_help(self):
+        messagebox.showinfo(
+            "Trim controls",
+            "Trim window keys:\n"
+            "  j/l = -/+ 1 frame\n"
+            "  a/d = -/+ 15 frames\n"
+            "  i = set IN\n"
+            "  o = set OUT\n"
+            "  s = save clip\n"
+            "  q = quit trim"
+        )
+
+    def show_annot_help(self):
+        messagebox.showinfo(
+            "Annotation controls",
+            "Per robot:\n"
+            "  1) Drag bbox + Enter\n"
+            "  2) Click blade LEFT endpoint\n"
+            "  3) Click blade RIGHT endpoint\n\n"
+            "Review window:\n"
+            "  n = save + next\n"
+            "  r = redo frame\n"
+            "  q = quit annotation"
+        )
 
     def _add_labeled_entry(self, parent, label, var):
         r = ttk.Frame(parent)

@@ -92,6 +92,14 @@ def shutil_which(cmd: str) -> Optional[str]:
     return None
 
 
+def _named_window(name: str):
+    cv2 = require_cv2()
+    flags = cv2.WINDOW_AUTOSIZE
+    if hasattr(cv2, "WINDOW_KEEPRATIO"):
+        flags |= cv2.WINDOW_KEEPRATIO
+    cv2.namedWindow(name, flags)
+
+
 @dataclass
 class RobotLabel:
     robot_id: int
@@ -138,7 +146,7 @@ def trim_video(video: Path, out_clip: Path) -> int:
         return 3
 
     start_f, end_f, cur = 0, total - 1, 0
-    cv2.namedWindow("Trim Studio", cv2.WINDOW_NORMAL)
+    _named_window("Trim Studio")
     cv2.createTrackbar("frame", "Trim Studio", 0, max(1, total - 1), lambda x: None)
 
     print("Trim controls: j/l +/-1, a/d +/-15, i=set IN, o=set OUT, s=save, q=quit")
@@ -153,6 +161,7 @@ def trim_video(video: Path, out_clip: Path) -> int:
         vis = frame.copy()
         cv2.putText(vis, f"frame={cur}/{total-1}", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.putText(vis, f"IN={start_f} OUT={end_f}", (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(vis, "j/l:+-1  a/d:+-15  i:set IN  o:set OUT  s:save  q:quit", (15, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 2)
         cv2.imshow("Trim Studio", vis)
 
         k = cv2.waitKey(0) & 0xFF
@@ -231,7 +240,7 @@ def _point_picker(base_img, title: str, color=(255, 255, 0)):
             pt[0], pt[1] = int(x), int(y)
             clicked["ok"] = True
 
-    cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+    _named_window(title)
     cv2.setMouseCallback(title, on_mouse)
 
     while True:
@@ -266,7 +275,10 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
 
         labels: List[RobotLabel] = []
         for rid in [1, 2]:
-            roi = cv2.selectROI(f"R{rid} bbox", frame, fromCenter=False, showCrosshair=True)
+            roi_win = f"R{rid} bbox (drag + Enter, ESC skip)"
+            _named_window(roi_win)
+            roi = cv2.selectROI(roi_win, frame, fromCenter=False, showCrosshair=True)
+            cv2.destroyWindow(roi_win)
             x, y, bw, bh = [int(v) for v in roi]
             if bw <= 0 or bh <= 0:
                 continue
@@ -315,6 +327,7 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
             cv2.line(review, lb.center_xy, lb.blade_mid_xy, (255, 255, 0), 2)
             cv2.putText(review, f"R{lb.robot_id} {lb.heading_deg:.1f}deg", (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
+        cv2.putText(review, "Review: n=save next, r=redo frame, q=quit", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
         cv2.imshow("Review (n/r/q)", review)
         key = cv2.waitKey(0) & 0xFF
         if key == ord("q"):
