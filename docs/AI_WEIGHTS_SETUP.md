@@ -81,3 +81,5 @@ This checks OpenCV/Ultralytics/FFmpeg and writable project folders.
 ## Dohyo labeling in Training Studio
 - Recommended next step: add a dedicated dohyo annotation mode (ellipse/circle + center + border band) so dohyo detection can be trained/fine-tuned from the same app.
 - Current app focuses on robot/blade labels; dohyo fine-tuning UI is not yet implemented in this revision.
+
+- Test-on-video now prints periodic infer progress in logs and limits robot detections to the detected dohyo area when available.

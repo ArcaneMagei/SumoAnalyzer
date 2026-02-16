@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 
 
+
 def require_cv2():
     try:
         import cv2
@@ -122,6 +123,7 @@ class FrameLabel:
     width: int
     height: int
     robots: List[RobotLabel]
+    dohyo_ellipse: Optional[Tuple[float, float, float, float, float]] = None  # cx,cy,axis_w,axis_h,angle
 
 
 def _heading_deg(center: Tuple[int, int], front: Tuple[int, int]) -> float:
@@ -383,6 +385,32 @@ def _extension_boxes(rb: dict, w: int, h: int) -> List[Tuple[int, int, int, int,
     return boxes
 
 
+
+
+def _pick_dohyo_ellipse(frame, window_name: str, frame_progress: str, prev_ellipse: Optional[Tuple[float, float, float, float, float]] = None) -> Optional[Tuple[float, float, float, float, float]]:
+    """Manual dohyo ellipse annotation by ROI with optional previous reuse."""
+    cv2 = require_cv2()
+    if prev_ellipse is not None:
+        vis = frame.copy()
+        cx, cy, aw, ah, ang = prev_ellipse
+        cv2.ellipse(vis, (int(cx), int(cy)), (int(aw / 2), int(ah / 2)), float(ang), 0, 360, (200, 255, 0), 2)
+        _overlay_lines(vis, [frame_progress, "Dohyo step: G=use previous ellipse | Enter=draw ROI ellipse"])
+        cv2.imshow(window_name, vis)
+        k = cv2.waitKey(0) & 0xFF
+        if k in (ord('g'), ord('G')):
+            return prev_ellipse
+
+    vis = frame.copy()
+    _overlay_lines(vis, [frame_progress, "Dohyo step: draw ROI around dohyo (Enter=confirm, ESC=skip)"])
+    roi = cv2.selectROI(window_name, vis, fromCenter=False, showCrosshair=True)
+    x, y, w, h = [int(v) for v in roi]
+    if w <= 0 or h <= 0:
+        return prev_ellipse
+    cx = float(x + w / 2.0)
+    cy = float(y + h / 2.0)
+    return (cx, cy, float(w), float(h), 0.0)
+
+
 def annotate_frames(
     frames_dir: Path,
     out_json_dir: Path,
@@ -422,6 +450,7 @@ def annotate_frames(
     window_name = "Annotation Studio"
     _named_window(window_name)
     prev_labels: List[RobotLabel] = []
+    prev_dohyo: Optional[Tuple[float, float, float, float, float]] = None
 
     for i, img_path in enumerate(selected, start=1):
         frame = cv2.imread(str(img_path))
@@ -453,8 +482,10 @@ def annotate_frames(
 
             if key in (ord("p"), ord("P")) and prev_labels:
                 labels = [RobotLabel(**asdict(lb)) for lb in prev_labels]
+                dohyo_ellipse = prev_dohyo
             else:
                 labels = []
+                dohyo_ellipse = _pick_dohyo_ellipse(frame, window_name, frame_progress, prev_ellipse=prev_dohyo)
                 for rid in [1, 2]:
                     roi_src = frame.copy()
                     _overlay_lines(
@@ -557,6 +588,9 @@ def annotate_frames(
                     2,
                 )
 
+            if dohyo_ellipse is not None:
+                cx, cy, aw, ah, ang = dohyo_ellipse
+                cv2.ellipse(review, (int(cx), int(cy)), (max(1, int(aw / 2)), max(1, int(ah / 2))), float(ang), 0, 360, (255, 255, 0), 2)
             _overlay_lines(
                 review,
                 [
@@ -580,7 +614,7 @@ def annotate_frames(
             if key not in (13, 32):
                 continue
 
-            rec = FrameLabel(image_name=img_path.name, width=w, height=h, robots=labels)
+            rec = FrameLabel(image_name=img_path.name, width=w, height=h, robots=labels, dohyo_ellipse=dohyo_ellipse)
             outp = out_json_dir / f"{img_path.stem}.json"
             if outp.exists() and skip_existing:
                 print(f"[{i}/{len(selected)}] exists, skipped write {outp.name}")
@@ -588,6 +622,7 @@ def annotate_frames(
                 outp.write_text(json.dumps(asdict(rec), indent=2), encoding="utf-8")
                 print(f"[{i}/{len(selected)}] approved {outp.name}")
             prev_labels = [RobotLabel(**asdict(lb)) for lb in labels]
+            prev_dohyo = dohyo_ellipse
             break
 
     cv2.destroyWindow(window_name)
@@ -722,6 +757,11 @@ def run_training(dataset_dir: Path, model: str, epochs: int, imgsz: int, batch: 
 def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, imgsz: int = 960) -> int:
     cv2 = require_cv2()
     try:
+        import numpy as np
+    except Exception as e:
+        print(f"NumPy missing: {e}")
+        return 2
+    try:
         from ultralytics import YOLO
     except Exception as e:
         print(f"Ultralytics missing: {e}")
@@ -742,55 +782,187 @@ def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, 
         print("Could not open video")
         return 3
 
+    # optional dohyo limiter
+    dohyo = None
+    try:
+        from models.dohyo import DohyoDetector
+        dohyo = DohyoDetector()
+    except Exception:
+        dohyo = None
+
     h, w = frame.shape[:2]
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     out_video.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(str(out_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
+    tracks = {
+        1: {"center": None, "vel": (0.0, 0.0), "miss": 0, "bbox": None, "blade": None, "conf": 0.0},
+        2: {"center": None, "vel": (0.0, 0.0), "miss": 0, "bbox": None, "blade": None, "conf": 0.0},
+    }
+
+    def _inside(mask, cx, cy):
+        return 0 <= cx < mask.shape[1] and 0 <= cy < mask.shape[0] and mask[cy, cx] > 0
+
+    def _pred_center(tk):
+        if tk["center"] is None:
+            return None
+        return (tk["center"][0] + tk["vel"][0], tk["center"][1] + tk["vel"][1])
+
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    frame_idx = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+        frame_idx += 1
 
-        res = model.predict(frame, conf=conf, imgsz=imgsz, verbose=False, max_det=6)
-        robots = []
-        blades = []
+        dohyo_mask = None
+        dohyo_ellipse = None
+        if dohyo is not None:
+            center, radius = dohyo.track(frame)
+            info = getattr(dohyo, "last_detection_info", None)
+            if info is not None:
+                cx, cy = [int(v) for v in info["center"]]
+                ax, ay = [max(1, int(v / 2)) for v in info["axes"]]
+                ang = float(info["angle"])
+                dohyo_ellipse = (cx, cy, ax, ay, ang)
+                dohyo_mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.ellipse(dohyo_mask, (cx, cy), (max(1, int(ax * 0.92)), max(1, int(ay * 0.92))), ang, 0, 360, 255, -1)
+
+        res = model.predict(frame, conf=conf, imgsz=imgsz, verbose=False, max_det=12)
+        raw_robots = []
+        raw_blades = []
         if res and len(res[0].boxes) > 0:
             for b in res[0].boxes:
                 x1, y1, x2, y2 = b.xyxy[0].cpu().numpy().astype(int)
                 cls = int(b.cls[0]) if b.cls is not None else -1
                 cf = float(b.conf[0])
+                x1 = max(0, x1); y1 = max(0, y1); x2 = min(w - 1, x2); y2 = min(h - 1, y2)
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                area = max(1, (x2 - x1) * (y2 - y1))
                 if cls == 0:
-                    robots.append((x1, y1, x2, y2, cf))
+                    if dohyo_mask is not None and not _inside(dohyo_mask, cx, cy):
+                        continue
+                    if area < 250 or area > int(0.20 * w * h):
+                        continue
+                    raw_robots.append((x1, y1, x2, y2, cf, cx, cy))
                 elif cls == 1:
-                    blades.append((x1, y1, x2, y2, cf))
+                    if dohyo_mask is not None and not _inside(dohyo_mask, cx, cy):
+                        continue
+                    raw_blades.append((x1, y1, x2, y2, cf, cx, cy))
 
-        for x1, y1, x2, y2, cf in robots:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            cv2.circle(frame, (cx, cy), 3, (0, 255, 0), -1)
+        # keep at most 2 likely robots
+        raw_robots = sorted(raw_robots, key=lambda z: z[4], reverse=True)[:6]
 
+        used = set()
+        for rid in [1, 2]:
+            tk = tracks[rid]
+            pred = _pred_center(tk)
+            best_j = None
+            best_cost = 1e9
+            for j, r in enumerate(raw_robots):
+                if j in used:
+                    continue
+                _, _, _, _, cf, cx, cy = r
+                if pred is None:
+                    cost = -cf * 50.0
+                else:
+                    d = float(np.hypot(cx - pred[0], cy - pred[1]))
+                    if d > 140:
+                        continue  # anti-teleport gate
+                    cost = d - cf * 20.0
+                if cost < best_cost:
+                    best_cost = cost
+                    best_j = j
+
+            if best_j is None:
+                tk["miss"] += 1
+                continue
+
+            used.add(best_j)
+            x1, y1, x2, y2, cf, cx, cy = raw_robots[best_j]
+            if tk["center"] is not None:
+                vx = cx - tk["center"][0]
+                vy = cy - tk["center"][1]
+                tk["vel"] = (0.65 * tk["vel"][0] + 0.35 * vx, 0.65 * tk["vel"][1] + 0.35 * vy)
+            tk["center"] = (cx, cy)
+            tk["bbox"] = (x1, y1, x2, y2)
+            tk["conf"] = cf
+            tk["miss"] = 0
+
+        # initialize missing tracks from remaining detections
+        for rid in [1, 2]:
+            tk = tracks[rid]
+            if tk["center"] is None and raw_robots:
+                for j, r in enumerate(raw_robots):
+                    if j in used:
+                        continue
+                    x1, y1, x2, y2, cf, cx, cy = r
+                    tk["center"] = (cx, cy)
+                    tk["bbox"] = (x1, y1, x2, y2)
+                    tk["conf"] = cf
+                    tk["vel"] = (0.0, 0.0)
+                    tk["miss"] = 0
+                    used.add(j)
+                    break
+
+        # blade assignment or prediction
+        for rid in [1, 2]:
+            tk = tracks[rid]
+            if tk["center"] is None:
+                continue
+            cx, cy = tk["center"]
             nearest = None
-            best_d = 1e12
-            for bx1, by1, bx2, by2, bcf in blades:
-                bcx, bcy = (bx1 + bx2) // 2, (by1 + by2) // 2
+            best_d = 1e9
+            for bx1, by1, bx2, by2, bcf, bcx, bcy in raw_blades:
                 d = (bcx - cx) ** 2 + (bcy - cy) ** 2
                 if d < best_d:
                     best_d = d
                     nearest = (bcx, bcy)
+            if nearest is not None and best_d < 140 * 140:
+                tk["blade"] = nearest
+            else:
+                # predict blade from motion vector if no direct blade detection
+                if tk["bbox"] is not None:
+                    x1, y1, x2, y2 = tk["bbox"]
+                    bw = max(8, x2 - x1)
+                    bh = max(8, y2 - y1)
+                    vx, vy = tk["vel"]
+                    norm = max(1e-3, float(np.hypot(vx, vy)))
+                    if norm < 1.5 and tk["blade"] is not None:
+                        pass
+                    else:
+                        ux, uy = vx / norm, vy / norm
+                        tk["blade"] = (int(cx + ux * max(bw, bh) * 0.45), int(cy + uy * max(bw, bh) * 0.45))
 
-            if nearest is not None:
-                cv2.circle(frame, nearest, 4, (255, 255, 0), -1)
-                cv2.line(frame, (cx, cy), nearest, (255, 255, 0), 2)
+        # draw overlay
+        if dohyo_ellipse is not None:
+            cx, cy, ax, ay, ang = dohyo_ellipse
+            cv2.ellipse(frame, (cx, cy), (ax, ay), ang, 0, 360, (255, 255, 0), 2)
 
-            cv2.putText(frame, f"robot {cf:.2f}", (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        for rid, tk in tracks.items():
+            if tk["center"] is None or tk["bbox"] is None:
+                continue
+            if tk["miss"] > 15:
+                continue
+            x1, y1, x2, y2 = tk["bbox"]
+            color = (0, 220, 0) if rid == 1 else (0, 180, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cx, cy = tk["center"]
+            cv2.circle(frame, (int(cx), int(cy)), 3, color, -1)
+            if tk["blade"] is not None:
+                bx, by = tk["blade"]
+                cv2.circle(frame, (int(bx), int(by)), 4, (255, 255, 0), -1)
+                cv2.line(frame, (int(cx), int(cy)), (int(bx), int(by)), (255, 255, 0), 2)
+            cv2.putText(frame, f"R{rid} {tk['conf']:.2f}", (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        for bx1, by1, bx2, by2, bcf in blades:
-            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (255, 200, 0), 2)
-            cv2.putText(frame, f"blade {bcf:.2f}", (bx1, max(20, by1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
-
+        cv2.putText(frame, f"Progress: {frame_idx}/{max(frame_idx, total)}", (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         writer.write(frame)
+
+        if frame_idx % 30 == 0:
+            pct = (100.0 * frame_idx / total) if total > 0 else 0.0
+            print(f"Infer progress: {frame_idx}/{total if total > 0 else '?'} ({pct:.1f}%)")
 
     cap.release()
     writer.release()

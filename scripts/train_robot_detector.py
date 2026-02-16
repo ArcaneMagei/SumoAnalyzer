@@ -110,6 +110,27 @@ def validate_labels(dataset_dir: Path, num_classes: int) -> None:
             raise ValueError(f"Label validation failed for split={split}:\n{preview}{more}")
 
 
+
+
+def _find_latest_weights(project_dir: Path, run_name: str) -> Path | None:
+    candidates = []
+    preferred = project_dir / run_name / "weights"
+    for p in [preferred / "best.pt", preferred / "last.pt"]:
+        if p.exists():
+            candidates.append(p)
+
+    for pat in ["**/weights/best.pt", "**/weights/last.pt"]:
+        for p in project_dir.glob(pat):
+            if p.is_file():
+                candidates.append(p)
+
+    if not candidates:
+        return None
+    uniq = list({str(c): c for c in candidates}.values())
+    uniq.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    return uniq[0]
+
+
 def detect_device(requested: str) -> str:
     if requested != "auto":
         return requested
@@ -191,22 +212,17 @@ def main() -> int:
         print(f"Original error: {e}", file=sys.stderr)
         return 5
 
-    run_dir = Path(args.project) / args.name / "weights"
-    best = run_dir / "best.pt"
-    last = run_dir / "last.pt"
-
     target = Path("models/weights/robot_sumo.pt")
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    if best.exists():
-        target.write_bytes(best.read_bytes())
-        print(f"Saved ready-to-use weights to {target} (from best.pt)")
-    elif last.exists():
-        target.write_bytes(last.read_bytes())
-        print(f"Saved ready-to-use weights to {target} (from last.pt, best.pt missing)")
-    else:
+    latest = _find_latest_weights(Path(args.project), args.name)
+    if latest is None:
         print("Training finished, but no weights found (best.pt/last.pt missing).", file=sys.stderr)
+        print(f"Searched in: {Path(args.project).resolve()}", file=sys.stderr)
         return 4
+
+    target.write_bytes(latest.read_bytes())
+    print(f"Saved ready-to-use weights to {target} (from {latest})")
 
     return 0
 

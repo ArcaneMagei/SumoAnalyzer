@@ -61,3 +61,5 @@ python scripts/training_studio.py doctor
 - Use `frame step` > 1 and/or `max frames` to avoid over-labeling near-duplicate frames.
 
 - When reopening annotation, the app logs resume state (`already annotated X/Y`) and continues from unannotated frames by default.
+
+- Each annotation frame now includes a **dohyo ellipse** step (draw ROI around dohyo, or reuse previous ellipse) before robot labels.
