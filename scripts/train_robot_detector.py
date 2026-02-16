@@ -1,23 +1,7 @@
 """Train custom YOLO model for robot sumo detection.
 
-Usage:
-  python scripts/train_robot_detector.py \
-      --dataset-dir data/robot_dataset \
-      --model yolov8n.pt \
-      --epochs 120 \
-      --imgsz 960
-
-Expected dataset layout (YOLO format):
-  data/robot_dataset/
-    images/train/*.jpg
-    images/val/*.jpg
-    labels/train/*.txt
-    labels/val/*.txt
-
-Class mapping (required):
-  0 robot
-Optional:
-  1 blade_front
+This version includes dataset sanity checks and safer defaults for Windows/CPU
+machines where dataloader workers can crash at epoch start.
 """
 
 from __future__ import annotations
@@ -53,6 +37,69 @@ def validate_structure(dataset_dir: Path) -> None:
         raise FileNotFoundError("Missing dataset dirs:\n" + "\n".join(str(m) for m in missing))
 
 
+def _image_files(folder: Path) -> list[Path]:
+    exts = ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"]
+    out: list[Path] = []
+    for e in exts:
+        out.extend(folder.glob(e))
+    return sorted(out)
+
+
+def validate_labels(dataset_dir: Path, num_classes: int) -> None:
+    """Hard-fail on malformed YOLO labels that often crash training."""
+    for split in ["train", "val"]:
+        img_dir = dataset_dir / "images" / split
+        lbl_dir = dataset_dir / "labels" / split
+
+        imgs = _image_files(img_dir)
+        if not imgs:
+            raise ValueError(f"No images found in {img_dir}")
+
+        bad = []
+        for img in imgs:
+            label = lbl_dir / f"{img.stem}.txt"
+            if not label.exists():
+                continue
+            lines = [ln.strip() for ln in label.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            for li, ln in enumerate(lines, start=1):
+                parts = ln.split()
+                if len(parts) != 5:
+                    bad.append(f"{label}:{li} expected 5 columns, got {len(parts)}")
+                    continue
+                try:
+                    cls = int(float(parts[0]))
+                    vals = [float(v) for v in parts[1:]]
+                except Exception:
+                    bad.append(f"{label}:{li} non-numeric values")
+                    continue
+
+                if cls < 0 or cls >= num_classes:
+                    bad.append(f"{label}:{li} class {cls} out of range [0,{num_classes-1}]")
+                x, y, w, h = vals
+                if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 and 0.0 < w <= 1.0 and 0.0 < h <= 1.0):
+                    bad.append(f"{label}:{li} invalid normalized bbox {vals}")
+
+        if bad:
+            preview = "\n".join(bad[:25])
+            more = "" if len(bad) <= 25 else f"\n... and {len(bad)-25} more"
+            raise ValueError(f"Label validation failed for split={split}:\n{preview}{more}")
+
+
+def detect_device(requested: str) -> str:
+    if requested != "auto":
+        return requested
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "0"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-dir", default="data/robot_dataset")
@@ -60,10 +107,14 @@ def main() -> int:
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--batch", type=int, default=16)
-    parser.add_argument("--device", default="0", help="e.g. 0, 0,1, cpu, mps")
+    parser.add_argument("--device", default="auto", help="auto, 0, 0,1, cpu, mps")
     parser.add_argument("--project", default="runs/sumo")
     parser.add_argument("--name", default="robot_detector")
     parser.add_argument("--classes", default="robot,blade_front")
+    parser.add_argument("--workers", type=int, default=0, help="Use 0 first on Windows to avoid dataloader hangs")
+    parser.add_argument("--cache", action="store_true", help="Enable caching images in RAM")
+    parser.add_argument("--resume", action="store_true", help="Resume interrupted run")
+    parser.add_argument("--save-period", type=int, default=5)
     args = parser.parse_args()
 
     dataset_dir = Path(args.dataset_dir)
@@ -73,6 +124,7 @@ def main() -> int:
         print("At least one class is required", file=sys.stderr)
         return 2
 
+    validate_labels(dataset_dir, len(classes))
     data_yaml = ensure_data_yaml(dataset_dir, classes)
 
     try:
@@ -82,29 +134,53 @@ def main() -> int:
         print(f"Original error: {e}", file=sys.stderr)
         return 3
 
-    model = YOLO(args.model)
-    model.train(
-        data=str(data_yaml),
-        epochs=args.epochs,
-        imgsz=args.imgsz,
-        batch=args.batch,
-        device=args.device,
-        project=args.project,
-        name=args.name,
-        cache=True,
-        workers=8,
-        close_mosaic=10,
-        patience=30,
-    )
+    chosen_device = detect_device(args.device)
+    print(f"Training device: {chosen_device}")
+    print(f"Dataset: {dataset_dir.resolve()}")
+    print(f"Workers: {args.workers} | Cache: {args.cache}")
 
-    best = Path(args.project) / args.name / "weights" / "best.pt"
+    model = YOLO(args.model)
+    try:
+        model.train(
+            data=str(data_yaml),
+            epochs=args.epochs,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            device=chosen_device,
+            project=args.project,
+            name=args.name,
+            cache=args.cache,
+            workers=args.workers,
+            close_mosaic=10,
+            patience=30,
+            save_period=args.save_period,
+            resume=args.resume,
+        )
+    except Exception as e:
+        print("\nTraining crashed.", file=sys.stderr)
+        print("Most common fixes:", file=sys.stderr)
+        print("  1) keep --workers 0 (especially on Windows)", file=sys.stderr)
+        print("  2) use --device cpu for debugging", file=sys.stderr)
+        print("  3) reduce --imgsz to 640 and --batch to 4", file=sys.stderr)
+        print("  4) check labels with this script (already enforced)", file=sys.stderr)
+        print(f"Original error: {e}", file=sys.stderr)
+        return 5
+
+    run_dir = Path(args.project) / args.name / "weights"
+    best = run_dir / "best.pt"
+    last = run_dir / "last.pt"
+
+    target = Path("models/weights/robot_sumo.pt")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
     if best.exists():
-        target = Path("models/weights/robot_sumo.pt")
-        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(best.read_bytes())
-        print(f"Saved ready-to-use weights to {target}")
+        print(f"Saved ready-to-use weights to {target} (from best.pt)")
+    elif last.exists():
+        target.write_bytes(last.read_bytes())
+        print(f"Saved ready-to-use weights to {target} (from last.pt, best.pt missing)")
     else:
-        print("Training finished, but best.pt not found. Check run logs.", file=sys.stderr)
+        print("Training finished, but no weights found (best.pt/last.pt missing).", file=sys.stderr)
         return 4
 
     return 0

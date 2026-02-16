@@ -91,7 +91,8 @@ python scripts/train_robot_detector.py \
   --epochs 120 \
   --imgsz 960 \
   --batch 16 \
-  --device 0
+  --device 0 \
+  --workers 0
 ```
 
 After training, best weights are copied to:
@@ -132,3 +133,21 @@ For strong performance on your case:
 - **Good:** 1,500+ frames across many tournaments/lighting conditions
 
 Label variety matters more than raw count.
+
+
+### If training stops very early
+
+Start with a debug run:
+
+```bash
+python scripts/train_robot_detector.py \
+  --dataset-dir data/robot_dataset \
+  --model yolov8n.pt \
+  --epochs 10 \
+  --imgsz 640 \
+  --batch 4 \
+  --device cpu \
+  --workers 0
+```
+
+If that works, switch to GPU and larger settings.

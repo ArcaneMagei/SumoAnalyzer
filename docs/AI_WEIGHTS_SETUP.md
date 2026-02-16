@@ -7,7 +7,7 @@ This project now supports AI-first detection through `models/weights/robot_sumo.
 On your machine (RTX 4090 recommended):
 
 ```bash
-pip install ultralytics opencv-python pyyaml
+pip install ultralytics opencv-python
 ```
 
 ## 2) Prepare dataset (YOLO format)
@@ -82,3 +82,31 @@ Detailed walkthrough is in:
 ```text
 docs/ANNOTATION_GUIDE.md
 ```
+
+
+## Troubleshooting: training stops at Epoch 1 with no weights
+
+If you see output like:
+
+```text
+Epoch 1/120 ... 0G ... 0/14
+```
+
+and then it stops, usually this means dataloader/runtime issue (not successful training completion).
+
+Use this safer command first:
+
+```bash
+python scripts/train_robot_detector.py   --dataset-dir data/robot_dataset   --model yolov8n.pt   --epochs 120   --imgsz 640   --batch 4   --device cpu   --workers 0
+```
+
+Then move to GPU:
+
+```bash
+python scripts/train_robot_detector.py   --dataset-dir data/robot_dataset   --model yolov8n.pt   --epochs 120   --imgsz 960   --batch 16   --device 0   --workers 0
+```
+
+Notes:
+- `0G` means you are not using CUDA GPU memory (likely CPU path).
+- this training script now validates labels before training and will fail early on bad annotation format.
+- if `best.pt` is not produced, script will fallback to `last.pt` when available and still copy to `models/weights/robot_sumo.pt`.
