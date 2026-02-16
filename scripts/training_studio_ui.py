@@ -58,6 +58,8 @@ class App(tk.Tk):
         self.geometry("960x720")
 
         self.state = load_project()
+        self._running = False
+        self.action_buttons = []
 
         self._build_ui()
         self._refresh_videos()
@@ -100,17 +102,27 @@ class App(tk.Tk):
         actions = ttk.LabelFrame(frm, text="Workflow Actions", padding=8)
         actions.pack(fill="x", pady=6)
 
+        self.step_var = tk.StringVar(value="Current step: 1) Trim clip")
+        ttk.Label(actions, textvariable=self.step_var).pack(anchor="w", pady=(0, 6))
+
         row1 = ttk.Frame(actions)
         row1.pack(fill="x", pady=3)
-        ttk.Button(row1, text="1) Trim clip", command=self.run_trim).pack(side="left", padx=4)
-        ttk.Button(row1, text="2) Extract frames", command=self.run_extract).pack(side="left", padx=4)
-        ttk.Button(row1, text="3) Annotate", command=self.run_annotate).pack(side="left", padx=4)
+        b1 = ttk.Button(row1, text="1) Trim clip", command=self.run_trim)
+        b1.pack(side="left", padx=4)
+        b2 = ttk.Button(row1, text="2) Extract frames", command=self.run_extract)
+        b2.pack(side="left", padx=4)
+        b3 = ttk.Button(row1, text="3) Annotate", command=self.run_annotate)
+        b3.pack(side="left", padx=4)
 
         row2 = ttk.Frame(actions)
         row2.pack(fill="x", pady=3)
-        ttk.Button(row2, text="4) Export YOLO labels", command=self.run_export).pack(side="left", padx=4)
-        ttk.Button(row2, text="5) Train model", command=self.run_train).pack(side="left", padx=4)
-        ttk.Button(row2, text="6) Test on video", command=self.run_infer).pack(side="left", padx=4)
+        b4 = ttk.Button(row2, text="4) Export YOLO labels", command=self.run_export)
+        b4.pack(side="left", padx=4)
+        b5 = ttk.Button(row2, text="5) Train model", command=self.run_train)
+        b5.pack(side="left", padx=4)
+        b6 = ttk.Button(row2, text="6) Test on video", command=self.run_infer)
+        b6.pack(side="left", padx=4)
+        self.action_buttons = [b1, b2, b3, b4, b5, b6]
 
         train_opts = ttk.Frame(actions)
         train_opts.pack(fill="x", pady=6)
@@ -137,8 +149,9 @@ class App(tk.Tk):
         guide_text = (
             "1) Trim clip: Use keys shown on frame: j/l +/-1, a/d +/-15, i set IN, o set OUT, s save.\n"
             "2) Extract frames: choose FPS (8-12 recommended).\n"
-            "3) Annotate: for each robot select bbox, click BODY center, click blade LEFT/RIGHT, then choose extension type.\n"
-            "4) Export YOLO labels -> 5) Train -> 6) Test on video."
+            "3) Annotate: single 'Annotation Studio' window. For each robot: bbox, BODY center, blade LEFT/RIGHT, extension type.\n"
+            "4) Export YOLO labels -> 5) Train -> 6) Test on video.\n"
+            "Tip: run one step at a time. Buttons are temporarily disabled while a step is running."
         )
         ttk.Label(guide, text=guide_text, justify="left").pack(anchor="w")
 
@@ -238,16 +251,31 @@ class App(tk.Tk):
         self._refresh_videos()
         self.save_state()
 
-    def _run_bg(self, title: str, fn):
+    def _set_running(self, running: bool):
+        self._running = running
+        state = "disabled" if running else "normal"
+        for btn in self.action_buttons:
+            btn.config(state=state)
+
+    def _run_bg(self, title: str, fn, next_step: str):
+        if self._running:
+            self._log("A workflow step is already running. Please wait for completion.")
+            return
+
         def worker():
             try:
                 self._log(f"== {title} ==")
                 rc = fn()
                 self._log(f"Done ({title}), rc={rc}")
+                if rc == 0:
+                    self.after(0, lambda: self.step_var.set(f"Current step: {next_step}"))
             except Exception as e:
                 self._log(f"ERROR ({title}): {e}")
                 self.after(0, lambda: messagebox.showerror("Error", str(e)))
+            finally:
+                self.after(0, lambda: self._set_running(False))
 
+        self._set_running(True)
         threading.Thread(target=worker, daemon=True).start()
 
     def run_trim(self):
@@ -256,7 +284,7 @@ class App(tk.Tk):
             v = studio.resolve_video_path(self.current_var.get())
             return studio.trim_video(v, Path(self.clip_var.get()))
 
-        self._run_bg("Trim", fn)
+        self._run_bg("Trim", fn, next_step="2) Extract frames")
 
     def run_extract(self):
         def fn():
@@ -265,14 +293,14 @@ class App(tk.Tk):
             fps = float(self.fps_var.get())
             return studio.extract_frames(v, Path(self.frames_var.get()), fps_out=fps)
 
-        self._run_bg("Extract", fn)
+        self._run_bg("Extract", fn, next_step="3) Annotate")
 
     def run_annotate(self):
         def fn():
             self.save_state()
             return studio.annotate_frames(Path(self.frames_var.get()), Path(self.ann_var.get()), start_index=0)
 
-        self._run_bg("Annotate", fn)
+        self._run_bg("Annotate", fn, next_step="4) Export YOLO labels")
 
     def run_export(self):
         def fn():
@@ -280,7 +308,7 @@ class App(tk.Tk):
             labels_out = Path(self.data_var.get()) / "labels" / "train"
             return studio.export_yolo_from_json(Path(self.frames_var.get()), Path(self.ann_var.get()), labels_out)
 
-        self._run_bg("Export YOLO", fn)
+        self._run_bg("Export YOLO", fn, next_step="5) Train model")
 
     def run_train(self):
         def fn():
@@ -295,7 +323,7 @@ class App(tk.Tk):
                 int(self.workers_var.get()),
             )
 
-        self._run_bg("Train", fn)
+        self._run_bg("Train", fn, next_step="6) Test on video")
 
     def run_infer(self):
         def fn():
@@ -303,7 +331,7 @@ class App(tk.Tk):
             v = studio.resolve_video_path(self.current_var.get())
             return studio.infer_video(Path(self.weights_var.get()), v, Path(self.infer_var.get()))
 
-        self._run_bg("Infer", fn)
+        self._run_bg("Infer", fn, next_step="1) Trim clip (new video)")
 
 
 if __name__ == "__main__":

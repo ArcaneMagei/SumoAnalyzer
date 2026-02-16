@@ -232,7 +232,22 @@ def extract_frames(video: Path, out_dir: Path, fps_out: float = 8.0) -> int:
     return 0
 
 
-def _point_picker(base_img, title: str, color=(255, 255, 0)):
+def _overlay_lines(img, lines: List[str], origin=(20, 30), line_h: int = 28):
+    cv2 = require_cv2()
+    x, y = origin
+    for ln in lines:
+        cv2.putText(img, ln, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (0, 0, 0), 4)
+        cv2.putText(img, ln, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)
+        y += line_h
+
+
+def _point_picker(
+    base_img,
+    title: str,
+    color=(255, 255, 0),
+    prompt: Optional[str] = None,
+    frame_progress: Optional[str] = None,
+):
     cv2 = require_cv2()
     pt = [0, 0]
     clicked = {"ok": False}
@@ -247,18 +262,27 @@ def _point_picker(base_img, title: str, color=(255, 255, 0)):
 
     while True:
         vis = base_img.copy()
+        lines = []
+        if frame_progress:
+            lines.append(frame_progress)
+        if prompt:
+            lines.append(prompt)
+        lines.append("Mouse: left click to place point | Enter/Space: confirm | R: reset")
+        _overlay_lines(vis, lines)
         if clicked["ok"]:
             cv2.circle(vis, (pt[0], pt[1]), 4, color, -1)
         cv2.imshow(title, vis)
         k = cv2.waitKey(20) & 0xFF
-        if clicked["ok"] and k != 255:
+        if k in (ord("r"), ord("R")):
+            clicked["ok"] = False
+        if clicked["ok"] and k in (13, 32):
             break
 
     cv2.destroyWindow(title)
     return int(pt[0]), int(pt[1])
 
 
-def _pick_extension_state(base_img, robot_id: int) -> Tuple[str, str]:
+def _pick_extension_state(base_img, robot_id: int, frame_progress: Optional[str] = None) -> Tuple[str, str]:
     """Pick extension metadata for a robot.
 
     Keys:
@@ -267,7 +291,7 @@ def _pick_extension_state(base_img, robot_id: int) -> Tuple[str, str]:
       b/v/m = blade left/right/both
     """
     cv2 = require_cv2()
-    title = f"R{robot_id} extension type"
+    title = "Annotation Studio"
     _named_window(title)
 
     legend = [
@@ -279,6 +303,8 @@ def _pick_extension_state(base_img, robot_id: int) -> Tuple[str, str]:
 
     while True:
         vis = base_img.copy()
+        if frame_progress:
+            cv2.putText(vis, frame_progress, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)
         y = 30
         for ln in legend:
             cv2.putText(vis, ln, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -296,7 +322,6 @@ def _pick_extension_state(base_img, robot_id: int) -> Tuple[str, str]:
             ord("m"): ("blade", "both"),
         }
         if key in mapping:
-            cv2.destroyWindow(title)
             return mapping[key]
 
 
@@ -347,8 +372,11 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
         return 2
 
     out_json_dir.mkdir(parents=True, exist_ok=True)
-    print("Annotate controls: ROI Enter confirm / ESC skip; review n=save r=redo q=quit")
-    print("For each robot you will pick: bbox -> body CENTER -> blade LEFT -> blade RIGHT -> extension state")
+    print("Annotate controls: drag bbox then ENTER; review n=save r=redo q=quit")
+    print("Per robot: bbox -> BODY center -> blade LEFT -> blade RIGHT -> extension state")
+
+    window_name = "Annotation Studio"
+    _named_window(window_name)
 
     for i, img_path in enumerate(imgs[start_index:], start=start_index):
         frame = cv2.imread(str(img_path))
@@ -356,12 +384,18 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
             continue
         h, w = frame.shape[:2]
 
+        frame_progress = f"Frame {i + 1}/{len(imgs)} - {img_path.name}"
         labels: List[RobotLabel] = []
         for rid in [1, 2]:
-            roi_win = f"R{rid} bbox (drag + Enter, ESC skip)"
-            _named_window(roi_win)
-            roi = cv2.selectROI(roi_win, frame, fromCenter=False, showCrosshair=True)
-            cv2.destroyWindow(roi_win)
+            roi_src = frame.copy()
+            _overlay_lines(
+                roi_src,
+                [
+                    frame_progress,
+                    f"Step R{rid}/2: Draw ROBOT BBOX (drag) then Enter. ESC=skip this robot.",
+                ],
+            )
+            roi = cv2.selectROI(window_name, roi_src, fromCenter=False, showCrosshair=True)
             x, y, bw, bh = [int(v) for v in roi]
             if bw <= 0 or bh <= 0:
                 continue
@@ -373,24 +407,39 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
             panel_center = frame.copy()
             cv2.rectangle(panel_center, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.circle(panel_center, default_center, 4, (0, 255, 0), -1)
-            cv2.putText(panel_center, f"R{rid}: click BODY center then key", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 255, 255), 2)
-            center = _point_picker(panel_center, f"R{rid} body-center picker", color=(0, 255, 0))
+            center = _point_picker(
+                panel_center,
+                window_name,
+                color=(0, 255, 0),
+                prompt=f"Step R{rid}/2: Click BODY center (true chassis center, not extension).",
+                frame_progress=frame_progress,
+            )
 
             panel = frame.copy()
             cv2.rectangle(panel, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(panel, f"R{rid}: click BLADE LEFT then key", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
-            bl = _point_picker(panel, "Blade-left picker", color=(255, 200, 0))
+            bl = _point_picker(
+                panel,
+                window_name,
+                color=(255, 200, 0),
+                prompt=f"Step R{rid}/2: Click BLADE LEFT endpoint.",
+                frame_progress=frame_progress,
+            )
 
             panel2 = frame.copy()
             cv2.rectangle(panel2, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.circle(panel2, bl, 4, (255, 200, 0), -1)
-            cv2.putText(panel2, f"R{rid}: click BLADE RIGHT then key", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
-            br = _point_picker(panel2, "Blade-right picker", color=(0, 255, 255))
+            br = _point_picker(
+                panel2,
+                window_name,
+                color=(0, 255, 255),
+                prompt=f"Step R{rid}/2: Click BLADE RIGHT endpoint.",
+                frame_progress=frame_progress,
+            )
 
             mid = ((bl[0] + br[0]) // 2, (bl[1] + br[1]) // 2)
             heading = _heading_deg(center, mid)
             blade_width = float(((br[0] - bl[0]) ** 2 + (br[1] - bl[1]) ** 2) ** 0.5)
-            ext_type, ext_side = _pick_extension_state(panel2, rid)
+            ext_type, ext_side = _pick_extension_state(panel2, rid, frame_progress=frame_progress)
 
             labels.append(
                 RobotLabel(
@@ -427,8 +476,14 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
                 2,
             )
 
-        cv2.putText(review, "Review: n=save next, r=redo frame, q=quit", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-        cv2.imshow("Review (n/r/q)", review)
+        _overlay_lines(
+            review,
+            [
+                frame_progress,
+                "Review step: N=save next frame | R=redo this frame | Q=quit",
+            ],
+        )
+        cv2.imshow(window_name, review)
         key = cv2.waitKey(0) & 0xFF
         if key == ord("q"):
             break
@@ -440,7 +495,7 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
         outp.write_text(json.dumps(asdict(rec), indent=2), encoding="utf-8")
         print(f"[{i+1}/{len(imgs)}] saved {outp.name}")
 
-    cv2.destroyAllWindows()
+    cv2.destroyWindow(window_name)
     return 0
 
 
