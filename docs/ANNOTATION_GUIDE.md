@@ -59,3 +59,5 @@ python scripts/training_studio.py doctor
 - Frame decision: `a` annotate, `p` propagate previous labels, `s` skip frame, `f` finish match, `x` exit annotator.
 - Review step: `Enter` approve frame, `r` redo, `s` skip, `f` finish match, `x` exit.
 - Use `frame step` > 1 and/or `max frames` to avoid over-labeling near-duplicate frames.
+
+- When reopening annotation, the app logs resume state (`already annotated X/Y`) and continues from unannotated frames by default.

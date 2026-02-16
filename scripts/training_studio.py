@@ -204,9 +204,17 @@ def trim_video(video: Path, out_clip: Path) -> int:
     return 0
 
 
-def extract_frames(video: Path, out_dir: Path, fps_out: float = 8.0) -> int:
+def extract_frames(video: Path, out_dir: Path, fps_out: float = 8.0, clear_existing: bool = True) -> int:
     cv2 = require_cv2()
     out_dir.mkdir(parents=True, exist_ok=True)
+    if clear_existing:
+        removed = 0
+        for pat in ("*.jpg", "*.jpeg", "*.png"):
+            for f in out_dir.glob(pat):
+                f.unlink(missing_ok=True)
+                removed += 1
+        if removed:
+            print(f"Cleared {removed} existing frames from {out_dir}")
 
     cap, err = open_video_capture(video)
     if not cap.isOpened():
@@ -422,161 +430,165 @@ def annotate_frames(
         h, w = frame.shape[:2]
         frame_progress = f"Frame {i}/{len(selected)} - {img_path.name}"
 
-        choice_img = frame.copy()
-        _overlay_lines(
-            choice_img,
-            [
-                frame_progress,
-                "A=Annotate | P=Use previous labels | S=Skip | F=Finish match | X=Exit",
-            ],
-        )
-        cv2.imshow(window_name, choice_img)
-        key = cv2.waitKey(0) & 0xFF
-        if key in (ord("x"), ord("X")):
-            break
-        if key in (ord("f"), ord("F")):
-            break
-        if key in (ord("s"), ord("S")):
-            print(f"[{i}/{len(selected)}] skipped {img_path.name}")
-            continue
-
-        if key in (ord("p"), ord("P")) and prev_labels:
-            labels = [RobotLabel(**asdict(lb)) for lb in prev_labels]
-        else:
-            labels = []
-            for rid in [1, 2]:
-                roi_src = frame.copy()
-                _overlay_lines(
-                    roi_src,
-                    [
-                        frame_progress,
-                        f"Robot {rid}/2: draw BODY bbox, Enter=confirm, ESC=skip robot",
-                    ],
-                )
-                roi = cv2.selectROI(window_name, roi_src, fromCenter=False, showCrosshair=True)
-                x, y, bw, bh = [int(v) for v in roi]
-                if bw <= 0 or bh <= 0:
-                    continue
-
-                x1, y1 = max(0, x), max(0, y)
-                x2, y2 = min(w - 1, x + bw), min(h - 1, y + bh)
-                default_center = ((x1 + x2) // 2, (y1 + y2) // 2)
-
-                panel_center = frame.copy()
-                cv2.rectangle(panel_center, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.circle(panel_center, default_center, 4, (0, 255, 0), -1)
-                center = _point_picker(
-                    panel_center,
-                    window_name,
-                    color=(0, 255, 0),
-                    prompt=f"Robot {rid}/2: click BODY center (chassis center).",
-                    frame_progress=frame_progress,
-                )
-
-                bl = br = mid = None
-                heading = 0.0
-                blade_width = 0.0
-                if annotate_blade:
-                    panel = frame.copy()
-                    cv2.rectangle(panel, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    bl = _point_picker(
-                        panel,
-                        window_name,
-                        color=(255, 200, 0),
-                        prompt=f"Robot {rid}/2: click blade LEFT endpoint.",
-                        frame_progress=frame_progress,
-                    )
-
-                    panel2 = frame.copy()
-                    cv2.rectangle(panel2, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.circle(panel2, bl, 4, (255, 200, 0), -1)
-                    br = _point_picker(
-                        panel2,
-                        window_name,
-                        color=(0, 255, 255),
-                        prompt=f"Robot {rid}/2: click blade RIGHT endpoint.",
-                        frame_progress=frame_progress,
-                    )
-                    bl, br = _line_editor(
-                        panel2,
-                        window_name,
-                        bl,
-                        br,
-                        frame_progress=frame_progress,
-                        prompt=f"Robot {rid}/2: drag points to align blade, Enter=confirm.",
-                    )
-                    mid = ((bl[0] + br[0]) // 2, (bl[1] + br[1]) // 2)
-                    heading = _heading_deg(center, mid)
-                    blade_width = float(((br[0] - bl[0]) ** 2 + (br[1] - bl[1]) ** 2) ** 0.5)
-
-                labels.append(
-                    RobotLabel(
-                        robot_id=rid,
-                        class_name="robot",
-                        bbox_xyxy=(x1, y1, x2, y2),
-                        center_xy=center,
-                        blade_left_xy=bl,
-                        blade_right_xy=br,
-                        blade_mid_xy=mid,
-                        heading_deg=heading,
-                        blade_width_px=blade_width,
-                        extension_type="none",
-                        extension_side="none",
-                        visible=True,
-                    )
-                )
-
-        review = frame.copy()
-        for lb in labels:
-            x1, y1, x2, y2 = lb.bbox_xyxy
-            cv2.rectangle(review, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            if lb.blade_left_xy and lb.blade_right_xy:
-                cv2.circle(review, lb.blade_left_xy, 4, (255, 200, 0), -1)
-                cv2.circle(review, lb.blade_right_xy, 4, (0, 255, 255), -1)
-                cv2.line(review, lb.blade_left_xy, lb.blade_right_xy, (255, 255, 0), 2)
-            if lb.center_xy and lb.blade_mid_xy:
-                cv2.line(review, lb.center_xy, lb.blade_mid_xy, (255, 255, 0), 2)
-            cv2.putText(
-                review,
-                f"R{lb.robot_id} heading={lb.heading_deg:.1f}",
-                (x1, max(20, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 255, 0),
-                2,
+        while True:
+            choice_img = frame.copy()
+            _overlay_lines(
+                choice_img,
+                [
+                    frame_progress,
+                    "A=Annotate | P=Use previous labels | S=Skip | F=Finish match | X=Exit",
+                ],
             )
+            cv2.imshow(window_name, choice_img)
+            key = cv2.waitKey(0) & 0xFF
+            if key in (ord("x"), ord("X")):
+                cv2.destroyWindow(window_name)
+                return 0
+            if key in (ord("f"), ord("F")):
+                cv2.destroyWindow(window_name)
+                return 0
+            if key in (ord("s"), ord("S")):
+                print(f"[{i}/{len(selected)}] skipped {img_path.name}")
+                break
 
-        _overlay_lines(
-            review,
-            [
-                frame_progress,
-                "Review: Enter=Approve frame | R=Redo frame | S=Skip frame | F=Finish match | X=Exit",
-            ],
-        )
-        cv2.imshow(window_name, review)
-        key = cv2.waitKey(0) & 0xFF
-        if key in (ord("x"), ord("X")):
-            break
-        if key in (ord("f"), ord("F")):
-            break
-        if key in (ord("s"), ord("S")):
-            print(f"[{i}/{len(selected)}] skipped {img_path.name}")
-            continue
-        if key in (ord("r"), ord("R")):
-            continue
-        if key in (ord("p"), ord("P")) and prev_labels:
-            labels = [RobotLabel(**asdict(lb)) for lb in prev_labels]
-        if key not in (13, 32, ord("p"), ord("P")):
-            continue
+            if key in (ord("p"), ord("P")) and prev_labels:
+                labels = [RobotLabel(**asdict(lb)) for lb in prev_labels]
+            else:
+                labels = []
+                for rid in [1, 2]:
+                    roi_src = frame.copy()
+                    _overlay_lines(
+                        roi_src,
+                        [
+                            frame_progress,
+                            f"Robot {rid}/2: draw BODY bbox, Enter=confirm, ESC=skip robot",
+                        ],
+                    )
+                    roi = cv2.selectROI(window_name, roi_src, fromCenter=False, showCrosshair=True)
+                    x, y, bw, bh = [int(v) for v in roi]
+                    if bw <= 0 or bh <= 0:
+                        continue
 
-        rec = FrameLabel(image_name=img_path.name, width=w, height=h, robots=labels)
-        outp = out_json_dir / f"{img_path.stem}.json"
-        if outp.exists() and skip_existing:
-            print(f"[{i}/{len(selected)}] exists, skipped write {outp.name}")
-            continue
-        outp.write_text(json.dumps(asdict(rec), indent=2), encoding="utf-8")
-        prev_labels = [RobotLabel(**asdict(lb)) for lb in labels]
-        print(f"[{i}/{len(selected)}] approved {outp.name}")
+                    x1, y1 = max(0, x), max(0, y)
+                    x2, y2 = min(w - 1, x + bw), min(h - 1, y + bh)
+                    default_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+
+                    panel_center = frame.copy()
+                    cv2.rectangle(panel_center, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.circle(panel_center, default_center, 4, (0, 255, 0), -1)
+                    center = _point_picker(
+                        panel_center,
+                        window_name,
+                        color=(0, 255, 0),
+                        prompt=f"Robot {rid}/2: click BODY center (chassis center).",
+                        frame_progress=frame_progress,
+                    )
+
+                    bl = br = mid = None
+                    heading = 0.0
+                    blade_width = 0.0
+                    if annotate_blade:
+                        panel = frame.copy()
+                        cv2.rectangle(panel, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        bl = _point_picker(
+                            panel,
+                            window_name,
+                            color=(255, 200, 0),
+                            prompt=f"Robot {rid}/2: click blade LEFT endpoint.",
+                            frame_progress=frame_progress,
+                        )
+
+                        panel2 = frame.copy()
+                        cv2.rectangle(panel2, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.circle(panel2, bl, 4, (255, 200, 0), -1)
+                        br = _point_picker(
+                            panel2,
+                            window_name,
+                            color=(0, 255, 255),
+                            prompt=f"Robot {rid}/2: click blade RIGHT endpoint.",
+                            frame_progress=frame_progress,
+                        )
+                        bl, br = _line_editor(
+                            panel2,
+                            window_name,
+                            bl,
+                            br,
+                            frame_progress=frame_progress,
+                            prompt=f"Robot {rid}/2: drag points to align blade, Enter=confirm.",
+                        )
+                        mid = ((bl[0] + br[0]) // 2, (bl[1] + br[1]) // 2)
+                        heading = _heading_deg(center, mid)
+                        blade_width = float(((br[0] - bl[0]) ** 2 + (br[1] - bl[1]) ** 2) ** 0.5)
+
+                    labels.append(
+                        RobotLabel(
+                            robot_id=rid,
+                            class_name="robot",
+                            bbox_xyxy=(x1, y1, x2, y2),
+                            center_xy=center,
+                            blade_left_xy=bl,
+                            blade_right_xy=br,
+                            blade_mid_xy=mid,
+                            heading_deg=heading,
+                            blade_width_px=blade_width,
+                            extension_type="none",
+                            extension_side="none",
+                            visible=True,
+                        )
+                    )
+
+            review = frame.copy()
+            for lb in labels:
+                x1, y1, x2, y2 = lb.bbox_xyxy
+                cv2.rectangle(review, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                if lb.blade_left_xy and lb.blade_right_xy:
+                    cv2.circle(review, lb.blade_left_xy, 4, (255, 200, 0), -1)
+                    cv2.circle(review, lb.blade_right_xy, 4, (0, 255, 255), -1)
+                    cv2.line(review, lb.blade_left_xy, lb.blade_right_xy, (255, 255, 0), 2)
+                if lb.center_xy and lb.blade_mid_xy:
+                    cv2.line(review, lb.center_xy, lb.blade_mid_xy, (255, 255, 0), 2)
+                cv2.putText(
+                    review,
+                    f"R{lb.robot_id} heading={lb.heading_deg:.1f}",
+                    (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 0),
+                    2,
+                )
+
+            _overlay_lines(
+                review,
+                [
+                    frame_progress,
+                    "Review: Enter=Approve | R=Redo | S=Skip | F=Finish match | X=Exit",
+                ],
+            )
+            cv2.imshow(window_name, review)
+            key = cv2.waitKey(0) & 0xFF
+            if key in (ord("x"), ord("X")):
+                cv2.destroyWindow(window_name)
+                return 0
+            if key in (ord("f"), ord("F")):
+                cv2.destroyWindow(window_name)
+                return 0
+            if key in (ord("s"), ord("S")):
+                print(f"[{i}/{len(selected)}] skipped {img_path.name}")
+                break
+            if key in (ord("r"), ord("R")):
+                continue
+            if key not in (13, 32):
+                continue
+
+            rec = FrameLabel(image_name=img_path.name, width=w, height=h, robots=labels)
+            outp = out_json_dir / f"{img_path.stem}.json"
+            if outp.exists() and skip_existing:
+                print(f"[{i}/{len(selected)}] exists, skipped write {outp.name}")
+            else:
+                outp.write_text(json.dumps(asdict(rec), indent=2), encoding="utf-8")
+                print(f"[{i}/{len(selected)}] approved {outp.name}")
+            prev_labels = [RobotLabel(**asdict(lb)) for lb in labels]
+            break
 
     cv2.destroyWindow(window_name)
     return 0
@@ -596,6 +608,7 @@ def export_yolo_from_json(
     labels_out: Path,
     blade_box_thickness_px: int = 8,
     include_extension_classes: bool = False,
+    filename_prefix: str = "",
 ) -> int:
     labels_out.mkdir(parents=True, exist_ok=True)
     items = sorted(json_dir.glob("*.json"))
@@ -640,13 +653,15 @@ def export_yolo_from_json(
                     ecx, ecy, ebw, ebh = xyxy_to_norm(ex1, ey1, ex2, ey2, w, h)
                     lines.append(f"{cls_id} {ecx:.6f} {ecy:.6f} {ebw:.6f} {ebh:.6f}")
 
-        out_txt = labels_out / f"{jp.stem}.txt"
+        stem = f"{filename_prefix}{jp.stem}" if filename_prefix else jp.stem
+        out_txt = labels_out / f"{stem}.txt"
         out_txt.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
         if images_train_dir is not None:
             src_img = frames_dir / rec["image_name"]
             if src_img.exists():
-                dst_img = images_train_dir / src_img.name
+                dst_name = f"{filename_prefix}{src_img.name}" if filename_prefix else src_img.name
+                dst_img = images_train_dir / dst_name
                 if not dst_img.exists():
                     dst_img.write_bytes(src_img.read_bytes())
 
@@ -687,14 +702,21 @@ def run_training(dataset_dir: Path, model: str, epochs: int, imgsz: int, batch: 
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+        bufsize=0,
         env=env,
     )
     assert proc.stdout is not None
-    for line in proc.stdout:
-        print(line.rstrip())
+    while True:
+        raw = proc.stdout.readline()
+        if not raw:
+            break
+        try:
+            line = raw.decode("utf-8", errors="replace").rstrip()
+        except Exception:
+            line = str(raw).rstrip()
+        print(line)
     return int(proc.wait())
+
 
 
 def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, imgsz: int = 960) -> int:

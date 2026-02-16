@@ -180,10 +180,11 @@ class App(tk.Tk):
         self.batch_var = tk.StringVar(value="8")
         self.device_var = tk.StringVar(value="auto")
         self.workers_var = tk.StringVar(value="0")
-        self.frame_step_var = tk.StringVar(value="3")
+        self.frame_step_var = tk.StringVar(value="1")
         self.max_frames_var = tk.StringVar(value="0")
         self.bbox_only_var = tk.BooleanVar(value=False)
         self.include_ext_var = tk.BooleanVar(value=False)
+        self.export_all_var = tk.BooleanVar(value=True)
 
         for label, var, width in [
             ("extract fps", self.fps_var, 6),
@@ -204,7 +205,7 @@ class App(tk.Tk):
             "1) Select one match video (app auto-creates dedicated clip/frames/annotations folders).\n"
             "2) Trim and extract.\n"
             "3) Annotate: each frame can be Annotate / Propagate previous / Skip / Finish match.\n"
-            "4) Export labels and train.\n"
+            "4) Export labels (current match or all prepared matches) and train.\n"
             "Tip: frame-step > 1 speeds up annotation; app resumes existing annotations by default."
         )
         ttk.Label(guide, text=guide_text, justify="left").pack(anchor="w")
@@ -213,6 +214,7 @@ class App(tk.Tk):
         opts_row.pack(fill="x", pady=4)
         ttk.Checkbutton(opts_row, text="BBox-only annotation (skip blade points)", variable=self.bbox_only_var).pack(side="left", padx=4)
         ttk.Checkbutton(opts_row, text="Export extension classes", variable=self.include_ext_var).pack(side="left", padx=4)
+        ttk.Checkbutton(opts_row, text="Export ALL prepared matches", variable=self.export_all_var).pack(side="left", padx=4)
 
         help_row = ttk.Frame(guide)
         help_row.pack(fill="x", pady=4)
@@ -412,6 +414,8 @@ class App(tk.Tk):
             if not video:
                 raise ValueError("Select a current video first")
             m = self._ensure_match_entry(video)
+            done_before, total_before = _get_progress(Path(m["frames_dir"]), Path(m["annotations_dir"]))
+            self._log(f"Annotation resume state: {done_before}/{total_before} already annotated")
             rc = studio.annotate_frames(
                 Path(m["frames_dir"]),
                 Path(m["annotations_dir"]),
@@ -432,16 +436,41 @@ class App(tk.Tk):
     def run_export(self):
         def fn():
             self.save_state()
+            labels_out = Path(self.data_var.get()) / "labels" / "train"
+
+            if self.export_all_var.get():
+                total = 0
+                for video, m in self.state.get("matches", {}).items():
+                    ann_dir = Path(m.get("annotations_dir", ""))
+                    frm_dir = Path(m.get("frames_dir", ""))
+                    if not ann_dir.exists() or not any(ann_dir.glob("*.json")):
+                        continue
+                    prefix = f"{m.get('match_id', 'match')}_"
+                    rc = studio.export_yolo_from_json(
+                        frm_dir,
+                        ann_dir,
+                        labels_out,
+                        include_extension_classes=self.include_ext_var.get(),
+                        filename_prefix=prefix,
+                    )
+                    if rc != 0:
+                        return rc
+                    total += 1
+                    m["last_action"] = "export"
+                save_project(self.state)
+                self._log(f"Exported labels from {total} prepared matches")
+                return 0
+
             video = self.current_var.get().strip()
             if not video:
                 raise ValueError("Select a current video first")
             m = self._ensure_match_entry(video)
-            labels_out = Path(self.data_var.get()) / "labels" / "train"
             rc = studio.export_yolo_from_json(
                 Path(m["frames_dir"]),
                 Path(m["annotations_dir"]),
                 labels_out,
                 include_extension_classes=self.include_ext_var.get(),
+                filename_prefix=f"{m.get('match_id', 'match')}_",
             )
             if rc == 0:
                 m["last_action"] = "export"
