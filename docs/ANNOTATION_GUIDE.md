@@ -1,91 +1,85 @@
-# Robot Sumo AI Annotation Guide (Step-by-step, beginner friendly)
+# Robot Sumo Annotation Guide (Beginner Friendly)
 
-This guide explains exactly how to create high-quality training labels for robot position and blade/front orientation.
+Goal: produce high-quality labels for:
+- robot localization,
+- blade orientation (most important).
 
----
-
-## 1) Install tools
-
-On your training machine:
+This guide uses the unified tool:
 
 ```bash
-pip install opencv-python ultralytics
+python scripts/training_studio.py --help
 ```
 
 ---
 
-## 2) Prepare frames from your match videos
-
-Use the built-in sampler to extract diverse frames from one or more videos:
+## 1) Prepare action clip and frames
 
 ```bash
-python scripts/annotate_robot_dataset.py prepare \
-  --videos /path/match1.mov /path/match2.mov \
-  --out-dir data/robot_dataset \
-  --frames-per-video 150 \
-  --val-ratio 0.2
-```
-
-This creates YOLO-ready folders:
-
-```text
-data/robot_dataset/
-  images/train/
-  images/val/
-  labels/train/
-  labels/val/
-  meta/train/
-  meta/val/
+python scripts/training_studio.py trim --video /path/full_match.mov --out data/studio/clips/m1.mp4
+python scripts/training_studio.py extract --video data/studio/clips/m1.mp4 --out-dir data/studio/frames --fps 10
 ```
 
 ---
 
-## 3) Annotate train split
+## 2) Annotate frames
 
 ```bash
-python scripts/annotate_robot_dataset.py annotate \
-  --out-dir data/robot_dataset \
-  --split train
+python scripts/training_studio.py annotate --frames-dir data/studio/frames --out-json-dir data/studio/annotations
 ```
 
-### Annotation flow per frame
+For each robot (R1 then R2):
+1. Draw robot bbox (Enter confirms, ESC skips).
+2. Click **blade left endpoint**.
+3. Click **blade right endpoint**.
+4. Review and press:
+   - `n` save + next
+   - `r` redo frame
+   - `q` quit
 
-1. **Select robot bbox** (drag rectangle, press Enter).
-2. **Click front point** (blade/front direction) in the popup.
-3. Repeat for second robot (or ESC to skip if only one visible).
-4. Review overlay and press:
-   - `n` = save and next frame
-   - `r` = redo frame
-   - `q` = quit
-
-Do the same for validation split:
-
-```bash
-python scripts/annotate_robot_dataset.py annotate --out-dir data/robot_dataset --split val
-```
+Why endpoints and not only a point?
+- better orientation learning,
+- blade width supervision,
+- stronger signal under rotation.
 
 ---
 
-## 4) Label quality checklist (critical)
+## 3) Export YOLO labels
 
-For **every robot**:
-- Bounding box should tightly include chassis + relevant extensions.
-- Front point should be at true attacking front (blade tip direction).
-- If robots overlap, still annotate visible one as accurately as possible.
+```bash
+python scripts/training_studio.py export-yolo \
+  --frames-dir data/studio/frames \
+  --json-dir data/studio/annotations \
+  --labels-out data/robot_dataset/labels/train
+```
 
-Include hard cases:
-- stationary robots,
-- very fast bursts,
-- collisions/occlusions,
-- scratches/reflections on black dohyo,
-- camera shake/zoom.
+Label classes:
+- class `0` = robot bbox
+- class `1` = blade line region (derived from endpoint segment)
 
 ---
 
-## 5) Train the detector
+## 4) Quality checklist (critical)
+
+Per visible robot:
+- bbox tight around body/extensions,
+- blade endpoints match real blade width and front,
+- avoid guessing hidden geometry during occlusion.
+
+Include difficult frames:
+- collisions,
+- partial occlusion,
+- stationary start,
+- bright reflections/scratches,
+- motion blur.
+
+---
+
+## 5) Train + test
+
+Train:
 
 ```bash
-python scripts/train_robot_detector.py \
+python scripts/training_studio.py train \
   --dataset-dir data/robot_dataset \
   --model yolov8n.pt \
   --epochs 120 \
@@ -95,52 +89,23 @@ python scripts/train_robot_detector.py \
   --workers 0
 ```
 
-After training, best weights are copied to:
-
-```text
-models/weights/robot_sumo.pt
-```
-
----
-
-## 6) Validate detector output quickly
+Test on unseen video:
 
 ```bash
-python scripts/validate_robot_detector.py \
+python scripts/training_studio.py infer-video \
   --weights models/weights/robot_sumo.pt \
-  --video /path/match_test.mov \
-  --out artifacts/ai_detector_preview.mp4 \
-  --conf 0.2
+  --video /path/unseen.mov \
+  --out artifacts/infer_unseen.mp4
 ```
 
-Open `artifacts/ai_detector_preview.mp4` and check if boxes are stable on both moving and still robots.
-
 ---
 
-## 7) Use in app
+## 6) If training fails very early
 
-In Streamlit sidebar:
-- Enable **Use AI robot detector**
-- Set **AI weights path** = `models/weights/robot_sumo.pt`
-- Start with **AI confidence** around `0.15–0.30`
-
----
-
-## 8) Recommended dataset size
-
-For strong performance on your case:
-- **MVP:** 400–800 annotated frames
-- **Good:** 1,500+ frames across many tournaments/lighting conditions
-
-Label variety matters more than raw count.
-
-
-### If training stops very early
-
-Start with a debug run:
+Use safe debug config first:
 
 ```bash
-python scripts/train_robot_detector.py \
+python scripts/training_studio.py train \
   --dataset-dir data/robot_dataset \
   --model yolov8n.pt \
   --epochs 10 \
@@ -150,15 +115,4 @@ python scripts/train_robot_detector.py \
   --workers 0
 ```
 
-If that works, switch to GPU and larger settings.
-
-
-## Alternative all-in-one workflow
-
-You can also use the unified training app script:
-
-```bash
-python scripts/training_studio.py --help
-```
-
-It supports trimming clips, extracting frames, annotation, and YOLO export in one tool.
+If this works, switch to GPU/full settings.

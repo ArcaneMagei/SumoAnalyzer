@@ -1,127 +1,109 @@
 # AI Robot Detector Setup (Full Functional Workflow)
 
-This project now supports AI-first detection through `models/weights/robot_sumo.pt`.
-
-## 1) Install dependencies
-
-On your machine (RTX 4090 recommended):
-
-```bash
-pip install ultralytics opencv-python
-```
-
-## 2) Prepare dataset (YOLO format)
-
-Create:
-
-```text
-data/robot_dataset/
-  images/train/
-  images/val/
-  labels/train/
-  labels/val/
-```
-
-Label class `0` as `robot` (mandatory). Optional class `1`: `blade_front`.
-
-YOLO label line format:
-
-```text
-<class_id> <x_center_norm> <y_center_norm> <width_norm> <height_norm>
-```
-
-## 3) Train weights
-
-```bash
-python scripts/train_robot_detector.py \
-  --dataset-dir data/robot_dataset \
-  --model yolov8n.pt \
-  --epochs 120 \
-  --imgsz 960 \
-  --batch 16 \
-  --device 0
-```
-
-After training, best weights are copied automatically to:
+This project supports AI-first detection using:
 
 ```text
 models/weights/robot_sumo.pt
 ```
 
-## 4) Validate quickly
+## Install
 
 ```bash
-python scripts/validate_robot_detector.py \
+pip install ultralytics opencv-python
+```
+
+---
+
+## Preferred workflow: Training Studio (single app)
+
+Use one tool for all steps:
+
+```bash
+python scripts/training_studio.py --help
+```
+
+### Typical sequence
+
+1) Trim action clip:
+
+```bash
+python scripts/training_studio.py trim --video /path/full_match.mov --out data/studio/clips/m1.mp4
+```
+
+2) Extract frames:
+
+```bash
+python scripts/training_studio.py extract --video data/studio/clips/m1.mp4 --out-dir data/studio/frames --fps 10
+```
+
+3) Annotate robots + blade endpoints:
+
+```bash
+python scripts/training_studio.py annotate --frames-dir data/studio/frames --out-json-dir data/studio/annotations
+```
+
+4) Export YOLO labels:
+
+```bash
+python scripts/training_studio.py export-yolo \
+  --frames-dir data/studio/frames \
+  --json-dir data/studio/annotations \
+  --labels-out data/robot_dataset/labels/train
+```
+
+5) Train:
+
+```bash
+python scripts/training_studio.py train \
+  --dataset-dir data/robot_dataset \
+  --model yolov8n.pt \
+  --epochs 120 \
+  --imgsz 960 \
+  --batch 16 \
+  --device 0 \
+  --workers 0
+```
+
+6) Test on unseen video:
+
+```bash
+python scripts/training_studio.py infer-video \
   --weights models/weights/robot_sumo.pt \
-  --video /path/to/match.mov \
-  --out artifacts/ai_detector_preview.mp4 \
-  --conf 0.2
+  --video /path/unseen.mov \
+  --out artifacts/infer_unseen.mp4
 ```
 
-## 5) Use in app
+---
 
-- Enable **Use AI robot detector**.
-- Set **AI weights path** to `models/weights/robot_sumo.pt`.
-- Adjust **AI confidence** to ~0.15–0.30.
+## If training stalls at epoch 1 (common)
 
-## Practical recommendation
-
-Start with 300–600 labeled frames from your own footage, then add hard examples (collisions, occlusions, scratches, reflections). This dramatically improves stationary robot detection.
-
-
-## Manual annotation helper (recommended)
-
-If you are not sure how to annotate by hand, use:
+Use debug-safe settings first:
 
 ```bash
-python scripts/annotate_robot_dataset.py --help
+python scripts/training_studio.py train \
+  --dataset-dir data/robot_dataset \
+  --model yolov8n.pt \
+  --epochs 10 \
+  --imgsz 640 \
+  --batch 4 \
+  --device cpu \
+  --workers 0
 ```
 
-Detailed walkthrough is in:
+Then switch back to GPU and full settings.
 
-```text
-docs/ANNOTATION_GUIDE.md
-```
+---
 
+## More detailed blueprint
 
-## Troubleshooting: training stops at Epoch 1 with no weights
-
-If you see output like:
-
-```text
-Epoch 1/120 ... 0G ... 0/14
-```
-
-and then it stops, usually this means dataloader/runtime issue (not successful training completion).
-
-Use this safer command first:
-
-```bash
-python scripts/train_robot_detector.py   --dataset-dir data/robot_dataset   --model yolov8n.pt   --epochs 120   --imgsz 640   --batch 4   --device cpu   --workers 0
-```
-
-Then move to GPU:
-
-```bash
-python scripts/train_robot_detector.py   --dataset-dir data/robot_dataset   --model yolov8n.pt   --epochs 120   --imgsz 960   --batch 16   --device 0   --workers 0
-```
-
-Notes:
-- `0G` means you are not using CUDA GPU memory (likely CPU path).
-- this training script now validates labels before training and will fail early on bad annotation format.
-- if `best.pt` is not produced, script will fallback to `last.pt` when available and still copy to `models/weights/robot_sumo.pt`.
-
-
-## Dedicated training app workflow
-
-For a full training-first workflow (trim clips -> extract frames -> annotate robot + blade -> export), see:
+See:
 
 ```text
 docs/TRAINING_APP_BLUEPRINT.md
 ```
 
-Main tool:
+And detailed annotation UX guide:
 
-```bash
-python scripts/training_studio.py --help
+```text
+docs/ANNOTATION_GUIDE.md
 ```
