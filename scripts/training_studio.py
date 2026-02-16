@@ -727,6 +727,10 @@ def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, 
         print(f"Ultralytics missing: {e}")
         return 2
 
+    if not Path(weights).exists():
+        print(f"Weights file not found: {weights}")
+        return 2
+
     model = YOLO(str(weights))
     cap, err = open_video_capture(video)
     if not cap.isOpened():

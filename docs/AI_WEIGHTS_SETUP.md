@@ -71,3 +71,13 @@ This checks OpenCV/Ultralytics/FFmpeg and writable project folders.
 - Training defaults are tuned safer for local iteration in UI (`imgsz=640`, `batch=8`) and live output is streamed into the log.
 
 - In the UI, enable **Export ALL prepared matches** to merge labels from every annotated match into one training dataset.
+
+
+## Continuing after first successful training
+- Yes: after annotating more videos, run **Export YOLO labels** again (preferably with **Export ALL prepared matches** enabled), then click **Train model** again.
+- This retrains on the expanded dataset and updates model quality incrementally.
+- You can optionally keep previous checkpoints in `runs/sumo/...` and set the Weights field for testing to the latest `best.pt`/`last.pt`.
+
+## Dohyo labeling in Training Studio
+- Recommended next step: add a dedicated dohyo annotation mode (ellipse/circle + center + border band) so dohyo detection can be trained/fine-tuned from the same app.
+- Current app focuses on robot/blade labels; dohyo fine-tuning UI is not yet implemented in this revision.

@@ -104,3 +104,7 @@ python -m scripts.training_studio_ui
 
 ## Data isolation
 Each selected video gets its own workspace in `data/studio/matches/<match_id>/` with dedicated `clip/`, `frames/`, and `annotations/` folders. This prevents accidental mixing between matches and enables safe resume across sessions.
+
+
+## Multi-match dataset building
+Use the UI option **Export ALL prepared matches** to merge annotations from every prepared match into a single YOLO dataset before retraining.

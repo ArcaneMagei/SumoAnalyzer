@@ -67,6 +67,23 @@ def _get_progress(frames_dir: Path, ann_dir: Path) -> tuple[int, int]:
     return done, total_frames
 
 
+def _find_latest_weight_candidate() -> Path | None:
+    direct = Path("models/weights/robot_sumo.pt")
+    if direct.exists():
+        return direct
+
+    candidates = []
+    for pat in ["runs/sumo/**/weights/best.pt", "runs/sumo/**/weights/last.pt"]:
+        for p in Path(".").glob(pat):
+            if p.is_file():
+                candidates.append(p)
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
 def load_project() -> dict:
     if PROJECT_FILE.exists():
         try:
@@ -370,7 +387,8 @@ class App(tk.Tk):
                     self.after(0, lambda: self.step_var.set(f"Current step: {next_step}"))
             except Exception as e:
                 self._log(f"ERROR ({title}): {e}")
-                self.after(0, lambda: messagebox.showerror("Error", str(e)))
+                err_msg = str(e)
+                self.after(0, lambda msg=err_msg: messagebox.showerror("Error", msg))
             finally:
                 self.after(0, self._sync_ui_from_current_video)
                 self.after(0, lambda: self._set_running(False))
@@ -482,7 +500,7 @@ class App(tk.Tk):
     def run_train(self):
         def fn():
             self.save_state()
-            return studio.run_training(
+            rc = studio.run_training(
                 Path(self.data_var.get()),
                 "yolov8n.pt",
                 int(self.epochs_var.get()),
@@ -491,12 +509,27 @@ class App(tk.Tk):
                 self.device_var.get(),
                 int(self.workers_var.get()),
             )
+            latest = _find_latest_weight_candidate()
+            if latest is not None:
+                self.weights_var.set(str(latest))
+                self._log(f"Using weights: {latest}")
+            return rc
 
         self._run_bg("Train", fn, next_step="6) Test on video")
 
     def run_infer(self):
         def fn():
             self.save_state()
+            w = Path(self.weights_var.get())
+            if not w.exists():
+                latest = _find_latest_weight_candidate()
+                if latest is None:
+                    raise FileNotFoundError(
+                        "No trained weights found. Train first or set Weights path manually. "
+                        "Expected models/weights/robot_sumo.pt or runs/sumo/**/weights/best.pt"
+                    )
+                self.weights_var.set(str(latest))
+                self._log(f"Auto-selected latest weights: {latest}")
             v = studio.resolve_video_path(self.current_var.get())
             return studio.infer_video(Path(self.weights_var.get()), v, Path(self.infer_var.get()))
 
