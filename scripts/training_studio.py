@@ -106,14 +106,14 @@ class RobotLabel:
     class_name: str
     bbox_xyxy: Tuple[int, int, int, int]
     center_xy: Tuple[int, int]
-    blade_left_xy: Tuple[int, int]
-    blade_right_xy: Tuple[int, int]
-    blade_mid_xy: Tuple[int, int]
-    heading_deg: float
-    blade_width_px: float
-    extension_type: str
-    extension_side: str
-    visible: bool
+    blade_left_xy: Optional[Tuple[int, int]] = None
+    blade_right_xy: Optional[Tuple[int, int]] = None
+    blade_mid_xy: Optional[Tuple[int, int]] = None
+    heading_deg: float = 0.0
+    blade_width_px: float = 0.0
+    extension_type: str = "none"
+    extension_side: str = "none"
+    visible: bool = True
 
 
 @dataclass
@@ -282,47 +282,58 @@ def _point_picker(
     return int(pt[0]), int(pt[1])
 
 
-def _pick_extension_state(base_img, robot_id: int, frame_progress: Optional[str] = None) -> Tuple[str, str]:
-    """Pick extension metadata for a robot.
-
-    Keys:
-      n = none
-      f/g/h = flag left/right/both
-      b/v/m = blade left/right/both
-    """
+def _line_editor(
+    base_img,
+    title: str,
+    left_pt: Tuple[int, int],
+    right_pt: Tuple[int, int],
+    frame_progress: Optional[str] = None,
+    prompt: Optional[str] = None,
+) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """Adjust a two-point line by dragging endpoints for faster/blind blade labeling."""
     cv2 = require_cv2()
-    title = "Annotation Studio"
+    left = [int(left_pt[0]), int(left_pt[1])]
+    right = [int(right_pt[0]), int(right_pt[1])]
+    active = {"name": None}
+
+    def _dist2(x: int, y: int, p: List[int]) -> int:
+        return (x - p[0]) ** 2 + (y - p[1]) ** 2
+
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if _dist2(x, y, left) <= _dist2(x, y, right):
+                active["name"] = "left"
+            else:
+                active["name"] = "right"
+        elif event == cv2.EVENT_MOUSEMOVE and active["name"] is not None:
+            if active["name"] == "left":
+                left[0], left[1] = int(x), int(y)
+            else:
+                right[0], right[1] = int(x), int(y)
+        elif event == cv2.EVENT_LBUTTONUP:
+            active["name"] = None
+
     _named_window(title)
-
-    legend = [
-        "Select extension state:",
-        "n: none",
-        "f: flag-left  g: flag-right  h: flag-both",
-        "b: blade-left v: blade-right m: blade-both",
-    ]
-
+    cv2.setMouseCallback(title, on_mouse)
     while True:
         vis = base_img.copy()
+        lines = []
         if frame_progress:
-            cv2.putText(vis, frame_progress, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)
-        y = 30
-        for ln in legend:
-            cv2.putText(vis, ln, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            y += 28
-
+            lines.append(frame_progress)
+        if prompt:
+            lines.append(prompt)
+        lines.append("Drag closest endpoint to adjust blade line | Enter/Space: confirm")
+        _overlay_lines(vis, lines)
+        cv2.circle(vis, (left[0], left[1]), 5, (255, 200, 0), -1)
+        cv2.circle(vis, (right[0], right[1]), 5, (0, 255, 255), -1)
+        cv2.line(vis, (left[0], left[1]), (right[0], right[1]), (255, 255, 0), 2)
         cv2.imshow(title, vis)
-        key = cv2.waitKey(0) & 0xFF
-        mapping = {
-            ord("n"): ("none", "none"),
-            ord("f"): ("flag", "left"),
-            ord("g"): ("flag", "right"),
-            ord("h"): ("flag", "both"),
-            ord("b"): ("blade", "left"),
-            ord("v"): ("blade", "right"),
-            ord("m"): ("blade", "both"),
-        }
-        if key in mapping:
-            return mapping[key]
+        k = cv2.waitKey(20) & 0xFF
+        if k in (13, 32):
+            break
+
+    cv2.destroyWindow(title)
+    return (left[0], left[1]), (right[0], right[1])
 
 
 def _extension_boxes(rb: dict, w: int, h: int) -> List[Tuple[int, int, int, int, int]]:
@@ -364,7 +375,14 @@ def _extension_boxes(rb: dict, w: int, h: int) -> List[Tuple[int, int, int, int,
     return boxes
 
 
-def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) -> int:
+def annotate_frames(
+    frames_dir: Path,
+    out_json_dir: Path,
+    start_index: int = 0,
+    frame_step: int = 1,
+    max_frames: int = 0,
+    annotate_blade: bool = True,
+) -> int:
     cv2 = require_cv2()
     imgs = sorted([*frames_dir.glob("*.jpg"), *frames_dir.glob("*.png"), *frames_dir.glob("*.jpeg")])
     if not imgs:
@@ -372,103 +390,148 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
         return 2
 
     out_json_dir.mkdir(parents=True, exist_ok=True)
-    print("Annotate controls: drag bbox then ENTER; review n=save r=redo q=quit")
-    print("Per robot: bbox -> BODY center -> blade LEFT -> blade RIGHT -> extension state")
+    step = max(1, int(frame_step))
+    selected = imgs[start_index::step]
+    if max_frames > 0:
+        selected = selected[:max_frames]
+    if not selected:
+        print("No frames selected for annotation after applying start/step/max.")
+        return 2
+
+    print("Annotate controls: review n=save, k=skip frame, r=redo, c=copy previous, d=done, q=quit")
+    print("Per robot: bbox + BODY center" + (" + blade endpoints" if annotate_blade else ""))
 
     window_name = "Annotation Studio"
     _named_window(window_name)
+    prev_labels: List[RobotLabel] = []
 
-    for i, img_path in enumerate(imgs[start_index:], start=start_index):
+    for i, img_path in enumerate(selected, start=1):
         frame = cv2.imread(str(img_path))
         if frame is None:
             continue
         h, w = frame.shape[:2]
+        frame_progress = f"Frame {i}/{len(selected)} - {img_path.name}"
 
-        frame_progress = f"Frame {i + 1}/{len(imgs)} - {img_path.name}"
-        labels: List[RobotLabel] = []
-        for rid in [1, 2]:
-            roi_src = frame.copy()
-            _overlay_lines(
-                roi_src,
-                [
-                    frame_progress,
-                    f"Step R{rid}/2: Draw ROBOT BBOX (drag) then Enter. ESC=skip this robot.",
-                ],
-            )
-            roi = cv2.selectROI(window_name, roi_src, fromCenter=False, showCrosshair=True)
-            x, y, bw, bh = [int(v) for v in roi]
-            if bw <= 0 or bh <= 0:
-                continue
+        choice_img = frame.copy()
+        _overlay_lines(
+            choice_img,
+            [
+                frame_progress,
+                "A=annotate this frame | C=copy previous labels | K=skip | D=done match | Q=quit",
+            ],
+        )
+        cv2.imshow(window_name, choice_img)
+        key = cv2.waitKey(0) & 0xFF
+        if key in (ord("q"), ord("Q")):
+            break
+        if key in (ord("d"), ord("D")):
+            break
+        if key in (ord("k"), ord("K")):
+            print(f"[{i}/{len(selected)}] skipped {img_path.name}")
+            continue
 
-            x1, y1 = max(0, x), max(0, y)
-            x2, y2 = min(w - 1, x + bw), min(h - 1, y + bh)
-            default_center = ((x1 + x2) // 2, (y1 + y2) // 2)
-
-            panel_center = frame.copy()
-            cv2.rectangle(panel_center, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.circle(panel_center, default_center, 4, (0, 255, 0), -1)
-            center = _point_picker(
-                panel_center,
-                window_name,
-                color=(0, 255, 0),
-                prompt=f"Step R{rid}/2: Click BODY center (true chassis center, not extension).",
-                frame_progress=frame_progress,
-            )
-
-            panel = frame.copy()
-            cv2.rectangle(panel, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            bl = _point_picker(
-                panel,
-                window_name,
-                color=(255, 200, 0),
-                prompt=f"Step R{rid}/2: Click BLADE LEFT endpoint.",
-                frame_progress=frame_progress,
-            )
-
-            panel2 = frame.copy()
-            cv2.rectangle(panel2, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.circle(panel2, bl, 4, (255, 200, 0), -1)
-            br = _point_picker(
-                panel2,
-                window_name,
-                color=(0, 255, 255),
-                prompt=f"Step R{rid}/2: Click BLADE RIGHT endpoint.",
-                frame_progress=frame_progress,
-            )
-
-            mid = ((bl[0] + br[0]) // 2, (bl[1] + br[1]) // 2)
-            heading = _heading_deg(center, mid)
-            blade_width = float(((br[0] - bl[0]) ** 2 + (br[1] - bl[1]) ** 2) ** 0.5)
-            ext_type, ext_side = _pick_extension_state(panel2, rid, frame_progress=frame_progress)
-
-            labels.append(
-                RobotLabel(
-                    robot_id=rid,
-                    class_name="robot",
-                    bbox_xyxy=(x1, y1, x2, y2),
-                    center_xy=center,
-                    blade_left_xy=bl,
-                    blade_right_xy=br,
-                    blade_mid_xy=mid,
-                    heading_deg=heading,
-                    blade_width_px=blade_width,
-                    extension_type=ext_type,
-                    extension_side=ext_side,
-                    visible=True,
+        if key in (ord("c"), ord("C")) and prev_labels:
+            labels = [
+                RobotLabel(**asdict(lb)) if isinstance(lb, RobotLabel) else RobotLabel(**lb)
+                for lb in prev_labels
+            ]
+        else:
+            labels = []
+            for rid in [1, 2]:
+                roi_src = frame.copy()
+                _overlay_lines(
+                    roi_src,
+                    [
+                        frame_progress,
+                        f"Step R{rid}/2: Draw ROBOT BODY BBOX (drag) then Enter. ESC=skip robot.",
+                    ],
                 )
-            )
+                roi = cv2.selectROI(window_name, roi_src, fromCenter=False, showCrosshair=True)
+                x, y, bw, bh = [int(v) for v in roi]
+                if bw <= 0 or bh <= 0:
+                    continue
+
+                x1, y1 = max(0, x), max(0, y)
+                x2, y2 = min(w - 1, x + bw), min(h - 1, y + bh)
+                default_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+
+                panel_center = frame.copy()
+                cv2.rectangle(panel_center, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.circle(panel_center, default_center, 4, (0, 255, 0), -1)
+                center = _point_picker(
+                    panel_center,
+                    window_name,
+                    color=(0, 255, 0),
+                    prompt=f"Step R{rid}/2: Click BODY center (chassis center).",
+                    frame_progress=frame_progress,
+                )
+
+                bl = br = mid = None
+                heading = 0.0
+                blade_width = 0.0
+                if annotate_blade:
+                    panel = frame.copy()
+                    cv2.rectangle(panel, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    bl = _point_picker(
+                        panel,
+                        window_name,
+                        color=(255, 200, 0),
+                        prompt=f"Step R{rid}/2: Click BLADE LEFT endpoint.",
+                        frame_progress=frame_progress,
+                    )
+
+                    panel2 = frame.copy()
+                    cv2.rectangle(panel2, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.circle(panel2, bl, 4, (255, 200, 0), -1)
+                    br = _point_picker(
+                        panel2,
+                        window_name,
+                        color=(0, 255, 255),
+                        prompt=f"Step R{rid}/2: Click BLADE RIGHT endpoint.",
+                        frame_progress=frame_progress,
+                    )
+                    bl, br = _line_editor(
+                        panel2,
+                        window_name,
+                        bl,
+                        br,
+                        frame_progress=frame_progress,
+                        prompt=f"Step R{rid}/2: Adjust blade line (drag endpoints) for occluded/unclear blade.",
+                    )
+                    mid = ((bl[0] + br[0]) // 2, (bl[1] + br[1]) // 2)
+                    heading = _heading_deg(center, mid)
+                    blade_width = float(((br[0] - bl[0]) ** 2 + (br[1] - bl[1]) ** 2) ** 0.5)
+
+                labels.append(
+                    RobotLabel(
+                        robot_id=rid,
+                        class_name="robot",
+                        bbox_xyxy=(x1, y1, x2, y2),
+                        center_xy=center,
+                        blade_left_xy=bl,
+                        blade_right_xy=br,
+                        blade_mid_xy=mid,
+                        heading_deg=heading,
+                        blade_width_px=blade_width,
+                        extension_type="none",
+                        extension_side="none",
+                        visible=True,
+                    )
+                )
 
         review = frame.copy()
         for lb in labels:
             x1, y1, x2, y2 = lb.bbox_xyxy
             cv2.rectangle(review, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.circle(review, lb.blade_left_xy, 4, (255, 200, 0), -1)
-            cv2.circle(review, lb.blade_right_xy, 4, (0, 255, 255), -1)
-            cv2.line(review, lb.blade_left_xy, lb.blade_right_xy, (255, 255, 0), 2)
-            cv2.line(review, lb.center_xy, lb.blade_mid_xy, (255, 255, 0), 2)
+            if lb.blade_left_xy and lb.blade_right_xy:
+                cv2.circle(review, lb.blade_left_xy, 4, (255, 200, 0), -1)
+                cv2.circle(review, lb.blade_right_xy, 4, (0, 255, 255), -1)
+                cv2.line(review, lb.blade_left_xy, lb.blade_right_xy, (255, 255, 0), 2)
+            if lb.center_xy and lb.blade_mid_xy:
+                cv2.line(review, lb.center_xy, lb.blade_mid_xy, (255, 255, 0), 2)
             cv2.putText(
                 review,
-                f"R{lb.robot_id} {lb.heading_deg:.1f}deg ext={lb.extension_type}:{lb.extension_side}",
+                f"R{lb.robot_id} heading={lb.heading_deg:.1f}",
                 (x1, max(20, y1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -480,20 +543,28 @@ def annotate_frames(frames_dir: Path, out_json_dir: Path, start_index: int = 0) 
             review,
             [
                 frame_progress,
-                "Review step: N=save next frame | R=redo this frame | Q=quit",
+                "Review: N=save next | K=skip frame | R=redo | C=copy previous + save | D=done | Q=quit",
             ],
         )
         cv2.imshow(window_name, review)
         key = cv2.waitKey(0) & 0xFF
-        if key == ord("q"):
+        if key in (ord("q"), ord("Q")):
             break
-        if key == ord("r"):
+        if key in (ord("d"), ord("D")):
+            break
+        if key in (ord("k"), ord("K")):
+            print(f"[{i}/{len(selected)}] skipped {img_path.name}")
             continue
+        if key in (ord("r"), ord("R")):
+            continue
+        if key in (ord("c"), ord("C")) and prev_labels:
+            labels = [RobotLabel(**asdict(lb)) for lb in prev_labels]
 
         rec = FrameLabel(image_name=img_path.name, width=w, height=h, robots=labels)
         outp = out_json_dir / f"{img_path.stem}.json"
         outp.write_text(json.dumps(asdict(rec), indent=2), encoding="utf-8")
-        print(f"[{i+1}/{len(imgs)}] saved {outp.name}")
+        prev_labels = [RobotLabel(**asdict(lb)) for lb in labels]
+        print(f"[{i}/{len(selected)}] saved {outp.name}")
 
     cv2.destroyWindow(window_name)
     return 0
@@ -512,7 +583,7 @@ def export_yolo_from_json(
     json_dir: Path,
     labels_out: Path,
     blade_box_thickness_px: int = 8,
-    include_extension_classes: bool = True,
+    include_extension_classes: bool = False,
 ) -> int:
     labels_out.mkdir(parents=True, exist_ok=True)
     items = sorted(json_dir.glob("*.json"))
@@ -521,6 +592,14 @@ def export_yolo_from_json(
         return 2
 
     exported = 0
+    dataset_root = None
+    images_train_dir = None
+    parts = [x.lower() for x in labels_out.parts]
+    if len(parts) >= 2 and parts[-2:] == ["labels", "train"]:
+        dataset_root = labels_out.parent.parent
+        images_train_dir = dataset_root / "images" / "train"
+        images_train_dir.mkdir(parents=True, exist_ok=True)
+
     for jp in items:
         rec = json.loads(jp.read_text(encoding="utf-8"))
         w, h = int(rec["width"]), int(rec["height"])
@@ -531,15 +610,18 @@ def export_yolo_from_json(
             cx, cy, bw, bh = xyxy_to_norm(int(x1), int(y1), int(x2), int(y2), w, h)
             lines.append(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
 
-            blx, bly = rb["blade_left_xy"]
-            brx, bry = rb["blade_right_xy"]
-            bx1 = max(0, min(int(blx), int(brx)))
-            bx2 = min(w - 1, max(int(blx), int(brx)))
-            by_mid = int((int(bly) + int(bry)) / 2)
-            by1 = max(0, by_mid - blade_box_thickness_px // 2)
-            by2 = min(h - 1, by_mid + blade_box_thickness_px // 2)
-            fcx, fcy, fbw, fbh = xyxy_to_norm(bx1, by1, bx2, by2, w, h)
-            lines.append(f"1 {fcx:.6f} {fcy:.6f} {fbw:.6f} {fbh:.6f}")
+            bl = rb.get("blade_left_xy")
+            br = rb.get("blade_right_xy")
+            if bl and br:
+                blx, bly = bl
+                brx, bry = br
+                bx1 = max(0, min(int(blx), int(brx)))
+                bx2 = min(w - 1, max(int(blx), int(brx)))
+                by_mid = int((int(bly) + int(bry)) / 2)
+                by1 = max(0, by_mid - blade_box_thickness_px // 2)
+                by2 = min(h - 1, by_mid + blade_box_thickness_px // 2)
+                fcx, fcy, fbw, fbh = xyxy_to_norm(bx1, by1, bx2, by2, w, h)
+                lines.append(f"1 {fcx:.6f} {fcy:.6f} {fbw:.6f} {fbh:.6f}")
 
             if include_extension_classes:
                 for cls_id, ex1, ey1, ex2, ey2 in _extension_boxes(rb, w, h):
@@ -548,14 +630,24 @@ def export_yolo_from_json(
 
         out_txt = labels_out / f"{jp.stem}.txt"
         out_txt.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+        if images_train_dir is not None:
+            src_img = frames_dir / rec["image_name"]
+            if src_img.exists():
+                dst_img = images_train_dir / src_img.name
+                if not dst_img.exists():
+                    dst_img.write_bytes(src_img.read_bytes())
+
         exported += 1
 
     print(f"Exported YOLO labels: {exported} files -> {labels_out}")
+    if images_train_dir is not None:
+        print(f"Prepared training images: {images_train_dir}")
     return 0
 
 
 def run_training(dataset_dir: Path, model: str, epochs: int, imgsz: int, batch: int, device: str, workers: int) -> int:
-    classes = "robot,blade_front,flag_left,flag_right,flag_both,blade_ext_left,blade_ext_right,blade_ext_both"
+    classes = "robot,blade_front"
     cmd = [
         sys.executable,
         "scripts/train_robot_detector.py",
@@ -701,13 +793,16 @@ def main() -> int:
     p_annot.add_argument("--frames-dir", required=True)
     p_annot.add_argument("--out-json-dir", required=True)
     p_annot.add_argument("--start-index", type=int, default=0)
+    p_annot.add_argument("--frame-step", type=int, default=1, help="annotate every Nth frame (speedup)")
+    p_annot.add_argument("--max-frames", type=int, default=0, help="stop after annotating this many selected frames")
+    p_annot.add_argument("--bbox-only", action="store_true", help="annotate body bbox/center only, skip blade points")
 
     p_export = sub.add_parser("export-yolo", help="export YOLO txt labels from json annotations")
     p_export.add_argument("--frames-dir", required=True)
     p_export.add_argument("--json-dir", required=True)
     p_export.add_argument("--labels-out", required=True)
     p_export.add_argument("--blade-box-thickness-px", type=int, default=8)
-    p_export.add_argument("--no-extension-classes", action="store_true", help="disable extension class export (2..7)")
+    p_export.add_argument("--include-extension-classes", action="store_true", help="include extension classes (2..7) if present in JSON")
 
     p_train = sub.add_parser("train", help="launch robust training wrapper")
     p_train.add_argument("--dataset-dir", default="data/robot_dataset")
@@ -737,14 +832,21 @@ def main() -> int:
             v = resolve_video_path(args.video)
             return extract_frames(v, Path(args.out_dir), fps_out=args.fps)
         if args.cmd == "annotate":
-            return annotate_frames(Path(args.frames_dir), Path(args.out_json_dir), start_index=args.start_index)
+            return annotate_frames(
+                Path(args.frames_dir),
+                Path(args.out_json_dir),
+                start_index=args.start_index,
+                frame_step=args.frame_step,
+                max_frames=args.max_frames,
+                annotate_blade=not args.bbox_only,
+            )
         if args.cmd == "export-yolo":
             return export_yolo_from_json(
                 Path(args.frames_dir),
                 Path(args.json_dir),
                 Path(args.labels_out),
                 blade_box_thickness_px=args.blade_box_thickness_px,
-                include_extension_classes=not args.no_extension_classes,
+                include_extension_classes=args.include_extension_classes,
             )
         if args.cmd == "train":
             return run_training(Path(args.dataset_dir), args.model, args.epochs, args.imgsz, args.batch, args.device, args.workers)

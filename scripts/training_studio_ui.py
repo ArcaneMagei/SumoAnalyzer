@@ -132,9 +132,15 @@ class App(tk.Tk):
         self.batch_var = tk.StringVar(value="16")
         self.device_var = tk.StringVar(value="auto")
         self.workers_var = tk.StringVar(value="0")
+        self.frame_step_var = tk.StringVar(value="3")
+        self.max_frames_var = tk.StringVar(value="0")
+        self.bbox_only_var = tk.BooleanVar(value=False)
+        self.include_ext_var = tk.BooleanVar(value=False)
 
         for label, var, width in [
             ("extract fps", self.fps_var, 6),
+            ("frame step", self.frame_step_var, 6),
+            ("max frames", self.max_frames_var, 6),
             ("epochs", self.epochs_var, 6),
             ("imgsz", self.imgsz_var, 6),
             ("batch", self.batch_var, 6),
@@ -147,13 +153,19 @@ class App(tk.Tk):
         guide = ttk.LabelFrame(frm, text="What to do in each step", padding=8)
         guide.pack(fill="x", pady=6)
         guide_text = (
-            "1) Trim clip: Use keys shown on frame: j/l +/-1, a/d +/-15, i set IN, o set OUT, s save.\n"
-            "2) Extract frames: choose FPS (8-12 recommended).\n"
-            "3) Annotate: single 'Annotation Studio' window. For each robot: bbox, BODY center, blade LEFT/RIGHT, extension type.\n"
-            "4) Export YOLO labels -> 5) Train -> 6) Test on video.\n"
-            "Tip: run one step at a time. Buttons are temporarily disabled while a step is running."
+            "1) Trim clip: j/l +/-1, a/d +/-15, i set IN, o set OUT, s save.\n"
+            "2) Extract frames: FPS 8-12.\n"
+            "3) Annotate: single window. You can annotate, skip frame, copy previous labels, or finish early.\n"
+            "4) Export YOLO labels (default robot + blade classes only).\n"
+            "5) Train -> 6) Test on video.\n"
+            "Tip: use frame-step>1 to avoid labeling near-duplicate frames."
         )
         ttk.Label(guide, text=guide_text, justify="left").pack(anchor="w")
+
+        opts_row = ttk.Frame(guide)
+        opts_row.pack(fill="x", pady=4)
+        ttk.Checkbutton(opts_row, text="BBox-only annotation (skip blade points)", variable=self.bbox_only_var).pack(side="left", padx=4)
+        ttk.Checkbutton(opts_row, text="Export extension classes", variable=self.include_ext_var).pack(side="left", padx=4)
 
         help_row = ttk.Frame(guide)
         help_row.pack(fill="x", pady=4)
@@ -183,16 +195,19 @@ class App(tk.Tk):
     def show_annot_help(self):
         messagebox.showinfo(
             "Annotation controls",
-            "Per robot:\n"
-            "  1) Drag bbox + Enter\n"
-            "  2) Click BODY center\n"
-            "  3) Click blade LEFT endpoint\n"
-            "  4) Click blade RIGHT endpoint\n"
-            "  5) Pick extension key: n/f/g/h/b/v/m\n\n"
+            "Frame start:\n"
+            "  a = annotate frame\n"
+            "  c = copy previous labels\n"
+            "  k = skip frame\n"
+            "  d = done with match\n"
+            "  q = quit\n\n"
             "Review window:\n"
             "  n = save + next\n"
+            "  c = copy previous + save\n"
+            "  k = skip frame\n"
             "  r = redo frame\n"
-            "  q = quit annotation"
+            "  d = done with match\n"
+            "  q = quit"
         )
 
     def _add_labeled_entry(self, parent, label, var):
@@ -298,7 +313,14 @@ class App(tk.Tk):
     def run_annotate(self):
         def fn():
             self.save_state()
-            return studio.annotate_frames(Path(self.frames_var.get()), Path(self.ann_var.get()), start_index=0)
+            return studio.annotate_frames(
+                Path(self.frames_var.get()),
+                Path(self.ann_var.get()),
+                start_index=0,
+                frame_step=int(self.frame_step_var.get()),
+                max_frames=int(self.max_frames_var.get()),
+                annotate_blade=not self.bbox_only_var.get(),
+            )
 
         self._run_bg("Annotate", fn, next_step="4) Export YOLO labels")
 
@@ -306,7 +328,12 @@ class App(tk.Tk):
         def fn():
             self.save_state()
             labels_out = Path(self.data_var.get()) / "labels" / "train"
-            return studio.export_yolo_from_json(Path(self.frames_var.get()), Path(self.ann_var.get()), labels_out)
+            return studio.export_yolo_from_json(
+                Path(self.frames_var.get()),
+                Path(self.ann_var.get()),
+                labels_out,
+                include_extension_classes=self.include_ext_var.get(),
+            )
 
         self._run_bg("Export YOLO", fn, next_step="5) Train model")
 

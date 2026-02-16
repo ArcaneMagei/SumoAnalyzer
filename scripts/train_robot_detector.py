@@ -25,24 +25,49 @@ def ensure_data_yaml(dataset_dir: Path, classes: list[str]) -> Path:
     return data_yaml
 
 
-def validate_structure(dataset_dir: Path) -> None:
-    required = [
-        dataset_dir / "images" / "train",
-        dataset_dir / "images" / "val",
-        dataset_dir / "labels" / "train",
-        dataset_dir / "labels" / "val",
-    ]
-    missing = [p for p in required if not p.exists()]
-    if missing:
-        raise FileNotFoundError("Missing dataset dirs:\n" + "\n".join(str(m) for m in missing))
-
-
 def _image_files(folder: Path) -> list[Path]:
     exts = ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"]
     out: list[Path] = []
     for e in exts:
         out.extend(folder.glob(e))
     return sorted(out)
+
+
+
+
+def ensure_structure_and_val_split(dataset_dir: Path, val_ratio: float = 0.15) -> None:
+    """Create missing dirs and auto-build val split from train when absent."""
+    train_img = dataset_dir / "images" / "train"
+    val_img = dataset_dir / "images" / "val"
+    train_lbl = dataset_dir / "labels" / "train"
+    val_lbl = dataset_dir / "labels" / "val"
+
+    for d in [train_img, val_img, train_lbl, val_lbl]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    train_images = _image_files(train_img)
+    if not train_images:
+        raise FileNotFoundError(f"No training images found in {train_img}")
+
+    val_images = _image_files(val_img)
+    if val_images:
+        return
+
+    target = max(1, int(round(len(train_images) * max(0.05, min(0.4, val_ratio)))))
+    step = max(1, len(train_images) // target)
+    selected = [img for idx, img in enumerate(train_images) if idx % step == 0][:target]
+
+    for img in selected:
+        dst_img = val_img / img.name
+        if not dst_img.exists():
+            dst_img.write_bytes(img.read_bytes())
+
+        src_lbl = train_lbl / f"{img.stem}.txt"
+        dst_lbl = val_lbl / src_lbl.name
+        if src_lbl.exists() and not dst_lbl.exists():
+            dst_lbl.write_bytes(src_lbl.read_bytes())
+
+    print(f"Auto-created val split: {len(selected)} images in {val_img}")
 
 
 def validate_labels(dataset_dir: Path, num_classes: int) -> None:
@@ -110,7 +135,7 @@ def main() -> int:
     parser.add_argument("--device", default="auto", help="auto, 0, 0,1, cpu, mps")
     parser.add_argument("--project", default="runs/sumo")
     parser.add_argument("--name", default="robot_detector")
-    parser.add_argument("--classes", default="robot,blade_front,flag_left,flag_right,flag_both,blade_ext_left,blade_ext_right,blade_ext_both")
+    parser.add_argument("--classes", default="robot,blade_front")
     parser.add_argument("--workers", type=int, default=0, help="Use 0 first on Windows to avoid dataloader hangs")
     parser.add_argument("--cache", action="store_true", help="Enable caching images in RAM")
     parser.add_argument("--resume", action="store_true", help="Resume interrupted run")
@@ -118,7 +143,7 @@ def main() -> int:
     args = parser.parse_args()
 
     dataset_dir = Path(args.dataset_dir)
-    validate_structure(dataset_dir)
+    ensure_structure_and_val_split(dataset_dir)
     classes = [c.strip() for c in args.classes.split(",") if c.strip()]
     if not classes:
         print("At least one class is required", file=sys.stderr)
