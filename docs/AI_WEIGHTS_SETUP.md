@@ -110,3 +110,18 @@ Notes:
 - `0G` means you are not using CUDA GPU memory (likely CPU path).
 - this training script now validates labels before training and will fail early on bad annotation format.
 - if `best.pt` is not produced, script will fallback to `last.pt` when available and still copy to `models/weights/robot_sumo.pt`.
+
+
+## Dedicated training app workflow
+
+For a full training-first workflow (trim clips -> extract frames -> annotate robot + blade -> export), see:
+
+```text
+docs/TRAINING_APP_BLUEPRINT.md
+```
+
+Main tool:
+
+```bash
+python scripts/training_studio.py --help
+```

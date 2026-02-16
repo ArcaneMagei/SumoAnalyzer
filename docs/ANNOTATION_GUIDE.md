@@ -151,3 +151,14 @@ python scripts/train_robot_detector.py \
 ```
 
 If that works, switch to GPU and larger settings.
+
+
+## Alternative all-in-one workflow
+
+You can also use the unified training app script:
+
+```bash
+python scripts/training_studio.py --help
+```
+
+It supports trimming clips, extracting frames, annotation, and YOLO export in one tool.
