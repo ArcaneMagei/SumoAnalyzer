@@ -100,3 +100,7 @@ python scripts/training_studio_ui.py
 # or
 python -m scripts.training_studio_ui
 ```
+
+
+## Data isolation
+Each selected video gets its own workspace in `data/studio/matches/<match_id>/` with dedicated `clip/`, `frames/`, and `annotations/` folders. This prevents accidental mixing between matches and enables safe resume across sessions.

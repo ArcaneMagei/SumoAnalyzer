@@ -53,3 +53,9 @@ If setup issues occur, run:
 ```bash
 python scripts/training_studio.py doctor
 ```
+
+
+## Fast annotation controls
+- Frame decision: `a` annotate, `p` propagate previous labels, `s` skip frame, `f` finish match, `x` exit annotator.
+- Review step: `Enter` approve frame, `r` redo, `s` skip, `f` finish match, `x` exit.
+- Use `frame step` > 1 and/or `max frames` to avoid over-labeling near-duplicate frames.

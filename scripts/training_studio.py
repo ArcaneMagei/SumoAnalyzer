@@ -382,6 +382,7 @@ def annotate_frames(
     frame_step: int = 1,
     max_frames: int = 0,
     annotate_blade: bool = True,
+    skip_existing: bool = True,
 ) -> int:
     cv2 = require_cv2()
     imgs = sorted([*frames_dir.glob("*.jpg"), *frames_dir.glob("*.png"), *frames_dir.glob("*.jpeg")])
@@ -398,8 +399,17 @@ def annotate_frames(
         print("No frames selected for annotation after applying start/step/max.")
         return 2
 
-    print("Annotate controls: review n=save, k=skip frame, r=redo, c=copy previous, d=done, q=quit")
-    print("Per robot: bbox + BODY center" + (" + blade endpoints" if annotate_blade else ""))
+    existing = {p.stem for p in out_json_dir.glob("*.json")}
+    if skip_existing:
+        selected = [im for im in selected if im.stem not in existing]
+        if not selected:
+            print("All selected frames already annotated. Nothing to do.")
+            return 0
+
+    print("Annotation controls:")
+    print("  A=annotate current frame | P=propagate previous labels | S=skip frame")
+    print("  F=finish this match now | X=exit annotator")
+    print("  Review: Enter=approve frame | R=redo frame")
 
     window_name = "Annotation Studio"
     _named_window(window_name)
@@ -417,24 +427,21 @@ def annotate_frames(
             choice_img,
             [
                 frame_progress,
-                "A=annotate this frame | C=copy previous labels | K=skip | D=done match | Q=quit",
+                "A=Annotate | P=Use previous labels | S=Skip | F=Finish match | X=Exit",
             ],
         )
         cv2.imshow(window_name, choice_img)
         key = cv2.waitKey(0) & 0xFF
-        if key in (ord("q"), ord("Q")):
+        if key in (ord("x"), ord("X")):
             break
-        if key in (ord("d"), ord("D")):
+        if key in (ord("f"), ord("F")):
             break
-        if key in (ord("k"), ord("K")):
+        if key in (ord("s"), ord("S")):
             print(f"[{i}/{len(selected)}] skipped {img_path.name}")
             continue
 
-        if key in (ord("c"), ord("C")) and prev_labels:
-            labels = [
-                RobotLabel(**asdict(lb)) if isinstance(lb, RobotLabel) else RobotLabel(**lb)
-                for lb in prev_labels
-            ]
+        if key in (ord("p"), ord("P")) and prev_labels:
+            labels = [RobotLabel(**asdict(lb)) for lb in prev_labels]
         else:
             labels = []
             for rid in [1, 2]:
@@ -443,7 +450,7 @@ def annotate_frames(
                     roi_src,
                     [
                         frame_progress,
-                        f"Step R{rid}/2: Draw ROBOT BODY BBOX (drag) then Enter. ESC=skip robot.",
+                        f"Robot {rid}/2: draw BODY bbox, Enter=confirm, ESC=skip robot",
                     ],
                 )
                 roi = cv2.selectROI(window_name, roi_src, fromCenter=False, showCrosshair=True)
@@ -462,7 +469,7 @@ def annotate_frames(
                     panel_center,
                     window_name,
                     color=(0, 255, 0),
-                    prompt=f"Step R{rid}/2: Click BODY center (chassis center).",
+                    prompt=f"Robot {rid}/2: click BODY center (chassis center).",
                     frame_progress=frame_progress,
                 )
 
@@ -476,7 +483,7 @@ def annotate_frames(
                         panel,
                         window_name,
                         color=(255, 200, 0),
-                        prompt=f"Step R{rid}/2: Click BLADE LEFT endpoint.",
+                        prompt=f"Robot {rid}/2: click blade LEFT endpoint.",
                         frame_progress=frame_progress,
                     )
 
@@ -487,7 +494,7 @@ def annotate_frames(
                         panel2,
                         window_name,
                         color=(0, 255, 255),
-                        prompt=f"Step R{rid}/2: Click BLADE RIGHT endpoint.",
+                        prompt=f"Robot {rid}/2: click blade RIGHT endpoint.",
                         frame_progress=frame_progress,
                     )
                     bl, br = _line_editor(
@@ -496,7 +503,7 @@ def annotate_frames(
                         bl,
                         br,
                         frame_progress=frame_progress,
-                        prompt=f"Step R{rid}/2: Adjust blade line (drag endpoints) for occluded/unclear blade.",
+                        prompt=f"Robot {rid}/2: drag points to align blade, Enter=confirm.",
                     )
                     mid = ((bl[0] + br[0]) // 2, (bl[1] + br[1]) // 2)
                     heading = _heading_deg(center, mid)
@@ -543,28 +550,33 @@ def annotate_frames(
             review,
             [
                 frame_progress,
-                "Review: N=save next | K=skip frame | R=redo | C=copy previous + save | D=done | Q=quit",
+                "Review: Enter=Approve frame | R=Redo frame | S=Skip frame | F=Finish match | X=Exit",
             ],
         )
         cv2.imshow(window_name, review)
         key = cv2.waitKey(0) & 0xFF
-        if key in (ord("q"), ord("Q")):
+        if key in (ord("x"), ord("X")):
             break
-        if key in (ord("d"), ord("D")):
+        if key in (ord("f"), ord("F")):
             break
-        if key in (ord("k"), ord("K")):
+        if key in (ord("s"), ord("S")):
             print(f"[{i}/{len(selected)}] skipped {img_path.name}")
             continue
         if key in (ord("r"), ord("R")):
             continue
-        if key in (ord("c"), ord("C")) and prev_labels:
+        if key in (ord("p"), ord("P")) and prev_labels:
             labels = [RobotLabel(**asdict(lb)) for lb in prev_labels]
+        if key not in (13, 32, ord("p"), ord("P")):
+            continue
 
         rec = FrameLabel(image_name=img_path.name, width=w, height=h, robots=labels)
         outp = out_json_dir / f"{img_path.stem}.json"
+        if outp.exists() and skip_existing:
+            print(f"[{i}/{len(selected)}] exists, skipped write {outp.name}")
+            continue
         outp.write_text(json.dumps(asdict(rec), indent=2), encoding="utf-8")
         prev_labels = [RobotLabel(**asdict(lb)) for lb in labels]
-        print(f"[{i}/{len(selected)}] saved {outp.name}")
+        print(f"[{i}/{len(selected)}] approved {outp.name}")
 
     cv2.destroyWindow(window_name)
     return 0
@@ -669,7 +681,20 @@ def run_training(dataset_dir: Path, model: str, epochs: int, imgsz: int, batch: 
         classes,
     ]
     print("Running:", " ".join(cmd))
-    return subprocess.call(cmd)
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line.rstrip())
+    return int(proc.wait())
 
 
 def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, imgsz: int = 960) -> int:
@@ -796,6 +821,7 @@ def main() -> int:
     p_annot.add_argument("--frame-step", type=int, default=1, help="annotate every Nth frame (speedup)")
     p_annot.add_argument("--max-frames", type=int, default=0, help="stop after annotating this many selected frames")
     p_annot.add_argument("--bbox-only", action="store_true", help="annotate body bbox/center only, skip blade points")
+    p_annot.add_argument("--allow-overwrite", action="store_true", help="allow overwriting existing annotation JSON files")
 
     p_export = sub.add_parser("export-yolo", help="export YOLO txt labels from json annotations")
     p_export.add_argument("--frames-dir", required=True)
@@ -839,6 +865,7 @@ def main() -> int:
                 frame_step=args.frame_step,
                 max_frames=args.max_frames,
                 annotate_blade=not args.bbox_only,
+                skip_existing=not args.allow_overwrite,
             )
         if args.cmd == "export-yolo":
             return export_yolo_from_json(

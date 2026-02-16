@@ -63,3 +63,9 @@ python scripts/training_studio.py doctor
 ```
 
 This checks OpenCV/Ultralytics/FFmpeg and writable project folders.
+
+
+## UX/persistence notes
+- The UI now creates isolated per-match work folders under `data/studio/matches/<match_id>/` so clips/frames/annotations from one video do not mix with another.
+- Annotation resumes by default and skips already-annotated frames unless you explicitly use CLI `--allow-overwrite`.
+- Training defaults are tuned safer for local iteration in UI (`imgsz=640`, `batch=8`) and live output is streamed into the log.

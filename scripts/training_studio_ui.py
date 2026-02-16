@@ -6,6 +6,7 @@ Run:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import tkinter as tk
@@ -28,18 +29,61 @@ except ModuleNotFoundError:
 PROJECT_FILE = Path("data/studio/project.json")
 
 
+def _slug(s: str) -> str:
+    clean = "".join(ch.lower() if ch.isalnum() else "_" for ch in s).strip("_")
+    return clean or "match"
+
+
+def _match_id(video_path: str) -> str:
+    p = Path(video_path)
+    digest = hashlib.sha1(str(p).encode("utf-8")).hexdigest()[:8]
+    return f"{_slug(p.stem)}_{digest}"
+
+
+def _match_paths(video_path: str) -> dict:
+    mid = _match_id(video_path)
+    base = Path("data/studio/matches") / mid
+    return {
+        "match_id": mid,
+        "clip_path": str(base / "clip" / f"{Path(video_path).stem}_action.mp4"),
+        "frames_dir": str(base / "frames"),
+        "annotations_dir": str(base / "annotations"),
+        "manifest": str(base / "manifest.json"),
+    }
+
+
+def _count_files(folder: Path, patterns: tuple[str, ...]) -> int:
+    if not folder.exists():
+        return 0
+    n = 0
+    for pat in patterns:
+        n += len(list(folder.glob(pat)))
+    return n
+
+
+def _get_progress(frames_dir: Path, ann_dir: Path) -> tuple[int, int]:
+    total_frames = _count_files(frames_dir, ("*.jpg", "*.jpeg", "*.png"))
+    done = _count_files(ann_dir, ("*.json",))
+    return done, total_frames
+
+
 def load_project() -> dict:
     if PROJECT_FILE.exists():
         try:
-            return json.loads(PROJECT_FILE.read_text(encoding="utf-8"))
+            data = json.loads(PROJECT_FILE.read_text(encoding="utf-8"))
+            data.setdefault("videos", [])
+            data.setdefault("matches", {})
+            data.setdefault("current_video", "")
+            data.setdefault("dataset_dir", "data/robot_dataset")
+            data.setdefault("weights", "models/weights/robot_sumo.pt")
+            data.setdefault("infer_out", "artifacts/training_studio_infer.mp4")
+            return data
         except Exception:
             pass
     return {
         "videos": [],
+        "matches": {},
         "current_video": "",
-        "clip_path": "data/studio/clips/current_action.mp4",
-        "frames_dir": "data/studio/frames",
-        "annotations_dir": "data/studio/annotations",
         "dataset_dir": "data/robot_dataset",
         "weights": "models/weights/robot_sumo.pt",
         "infer_out": "artifacts/training_studio_infer.mp4",
@@ -55,7 +99,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Robot Sumo Training Studio")
-        self.geometry("960x720")
+        self.geometry("1080x760")
 
         self.state = load_project()
         self._running = False
@@ -63,6 +107,7 @@ class App(tk.Tk):
 
         self._build_ui()
         self._refresh_videos()
+        self._sync_ui_from_current_video()
 
     def _build_ui(self):
         frm = ttk.Frame(self, padding=12)
@@ -71,7 +116,7 @@ class App(tk.Tk):
         top = ttk.LabelFrame(frm, text="Video Library", padding=8)
         top.pack(fill="x", pady=6)
 
-        self.video_list = tk.Listbox(top, height=6)
+        self.video_list = tk.Listbox(top, height=7)
         self.video_list.pack(side="left", fill="x", expand=True)
 
         btns = ttk.Frame(top)
@@ -80,13 +125,16 @@ class App(tk.Tk):
         ttk.Button(btns, text="Set selected", command=self.set_selected_video).pack(fill="x", pady=2)
         ttk.Button(btns, text="Remove selected", command=self.remove_selected_video).pack(fill="x", pady=2)
 
-        paths = ttk.LabelFrame(frm, text="Paths", padding=8)
+        self.status_var = tk.StringVar(value="No video selected")
+        ttk.Label(frm, textvariable=self.status_var).pack(anchor="w", pady=(0, 6))
+
+        paths = ttk.LabelFrame(frm, text="Per-match Paths (auto-managed)", padding=8)
         paths.pack(fill="x", pady=6)
 
         self.current_var = tk.StringVar(value=self.state.get("current_video", ""))
-        self.clip_var = tk.StringVar(value=self.state.get("clip_path", "data/studio/clips/current_action.mp4"))
-        self.frames_var = tk.StringVar(value=self.state.get("frames_dir", "data/studio/frames"))
-        self.ann_var = tk.StringVar(value=self.state.get("annotations_dir", "data/studio/annotations"))
+        self.clip_var = tk.StringVar(value="")
+        self.frames_var = tk.StringVar(value="")
+        self.ann_var = tk.StringVar(value="")
         self.data_var = tk.StringVar(value=self.state.get("dataset_dir", "data/robot_dataset"))
         self.weights_var = tk.StringVar(value=self.state.get("weights", "models/weights/robot_sumo.pt"))
         self.infer_var = tk.StringVar(value=self.state.get("infer_out", "artifacts/training_studio_infer.mp4"))
@@ -127,9 +175,9 @@ class App(tk.Tk):
         train_opts = ttk.Frame(actions)
         train_opts.pack(fill="x", pady=6)
         self.fps_var = tk.StringVar(value="10")
-        self.epochs_var = tk.StringVar(value="120")
-        self.imgsz_var = tk.StringVar(value="960")
-        self.batch_var = tk.StringVar(value="16")
+        self.epochs_var = tk.StringVar(value="80")
+        self.imgsz_var = tk.StringVar(value="640")
+        self.batch_var = tk.StringVar(value="8")
         self.device_var = tk.StringVar(value="auto")
         self.workers_var = tk.StringVar(value="0")
         self.frame_step_var = tk.StringVar(value="3")
@@ -150,15 +198,14 @@ class App(tk.Tk):
             ttk.Label(train_opts, text=label).pack(side="left", padx=3)
             ttk.Entry(train_opts, textvariable=var, width=width).pack(side="left", padx=3)
 
-        guide = ttk.LabelFrame(frm, text="What to do in each step", padding=8)
+        guide = ttk.LabelFrame(frm, text="Workflow Guidance", padding=8)
         guide.pack(fill="x", pady=6)
         guide_text = (
-            "1) Trim clip: j/l +/-1, a/d +/-15, i set IN, o set OUT, s save.\n"
-            "2) Extract frames: FPS 8-12.\n"
-            "3) Annotate: single window. You can annotate, skip frame, copy previous labels, or finish early.\n"
-            "4) Export YOLO labels (default robot + blade classes only).\n"
-            "5) Train -> 6) Test on video.\n"
-            "Tip: use frame-step>1 to avoid labeling near-duplicate frames."
+            "1) Select one match video (app auto-creates dedicated clip/frames/annotations folders).\n"
+            "2) Trim and extract.\n"
+            "3) Annotate: each frame can be Annotate / Propagate previous / Skip / Finish match.\n"
+            "4) Export labels and train.\n"
+            "Tip: frame-step > 1 speeds up annotation; app resumes existing annotations by default."
         )
         ttk.Label(guide, text=guide_text, justify="left").pack(anchor="w")
 
@@ -179,37 +226,6 @@ class App(tk.Tk):
 
         ttk.Button(frm, text="Save project", command=self.save_state).pack(anchor="e", pady=6)
 
-
-    def show_trim_help(self):
-        messagebox.showinfo(
-            "Trim controls",
-            "Trim window keys:\n"
-            "  j/l = -/+ 1 frame\n"
-            "  a/d = -/+ 15 frames\n"
-            "  i = set IN\n"
-            "  o = set OUT\n"
-            "  s = save clip\n"
-            "  q = quit trim"
-        )
-
-    def show_annot_help(self):
-        messagebox.showinfo(
-            "Annotation controls",
-            "Frame start:\n"
-            "  a = annotate frame\n"
-            "  c = copy previous labels\n"
-            "  k = skip frame\n"
-            "  d = done with match\n"
-            "  q = quit\n\n"
-            "Review window:\n"
-            "  n = save + next\n"
-            "  c = copy previous + save\n"
-            "  k = skip frame\n"
-            "  r = redo frame\n"
-            "  d = done with match\n"
-            "  q = quit"
-        )
-
     def _add_labeled_entry(self, parent, label, var):
         r = ttk.Frame(parent)
         r.pack(fill="x", pady=2)
@@ -226,15 +242,48 @@ class App(tk.Tk):
         self.log.see(tk.END)
         self.update_idletasks()
 
+    def _ensure_match_entry(self, video_path: str) -> dict:
+        matches = self.state.setdefault("matches", {})
+        if video_path not in matches:
+            m = _match_paths(video_path)
+            matches[video_path] = {
+                **m,
+                "annotate_completed": False,
+                "last_action": "created",
+            }
+        return matches[video_path]
+
+    def _sync_ui_from_current_video(self):
+        video = self.current_var.get().strip()
+        if not video:
+            return
+        m = self._ensure_match_entry(video)
+        self.clip_var.set(m["clip_path"])
+        self.frames_var.set(m["frames_dir"])
+        self.ann_var.set(m["annotations_dir"])
+
+        done, total = _get_progress(Path(m["frames_dir"]), Path(m["annotations_dir"]))
+        completed = bool(m.get("annotate_completed", False))
+        self.status_var.set(
+            f"Match: {Path(video).name} | Progress: {done}/{total} annotated"
+            + (" | COMPLETE" if completed else " | IN PROGRESS")
+        )
+
     def save_state(self):
         self.state["current_video"] = self.current_var.get().strip()
-        self.state["clip_path"] = self.clip_var.get().strip()
-        self.state["frames_dir"] = self.frames_var.get().strip()
-        self.state["annotations_dir"] = self.ann_var.get().strip()
         self.state["dataset_dir"] = self.data_var.get().strip()
         self.state["weights"] = self.weights_var.get().strip()
         self.state["infer_out"] = self.infer_var.get().strip()
+
+        cur = self.current_var.get().strip()
+        if cur:
+            m = self._ensure_match_entry(cur)
+            m["clip_path"] = self.clip_var.get().strip()
+            m["frames_dir"] = self.frames_var.get().strip()
+            m["annotations_dir"] = self.ann_var.get().strip()
+
         save_project(self.state)
+        self._sync_ui_from_current_video()
         self._log("Project saved.")
 
     def add_videos(self):
@@ -244,6 +293,8 @@ class App(tk.Tk):
         vids = set(self.state.get("videos", []))
         vids.update(files)
         self.state["videos"] = sorted(vids)
+        for v in files:
+            self._ensure_match_entry(v)
         self._refresh_videos()
         self.save_state()
 
@@ -253,6 +304,7 @@ class App(tk.Tk):
             return
         v = self.video_list.get(sel[0])
         self.current_var.set(v)
+        self._sync_ui_from_current_video()
         self.save_state()
 
     def remove_selected_video(self):
@@ -261,10 +313,40 @@ class App(tk.Tk):
             return
         v = self.video_list.get(sel[0])
         self.state["videos"] = [x for x in self.state.get("videos", []) if x != v]
+        self.state.setdefault("matches", {}).pop(v, None)
         if self.current_var.get() == v:
             self.current_var.set("")
         self._refresh_videos()
         self.save_state()
+
+    def show_trim_help(self):
+        messagebox.showinfo(
+            "Trim controls",
+            "Trim window keys:\n"
+            "  j/l = -/+ 1 frame\n"
+            "  a/d = -/+ 15 frames\n"
+            "  i = set IN\n"
+            "  o = set OUT\n"
+            "  s = save clip\n"
+            "  q = quit trim"
+        )
+
+    def show_annot_help(self):
+        messagebox.showinfo(
+            "Annotation controls",
+            "Frame decision:\n"
+            "  a = annotate now\n"
+            "  p = propagate previous labels\n"
+            "  s = skip frame\n"
+            "  f = finish this match\n"
+            "  x = exit annotator\n\n"
+            "Review step:\n"
+            "  Enter = approve frame\n"
+            "  r = redo frame\n"
+            "  s = skip frame\n"
+            "  f = finish this match\n"
+            "  x = exit annotator"
+        )
 
     def _set_running(self, running: bool):
         self._running = running
@@ -288,6 +370,7 @@ class App(tk.Tk):
                 self._log(f"ERROR ({title}): {e}")
                 self.after(0, lambda: messagebox.showerror("Error", str(e)))
             finally:
+                self.after(0, self._sync_ui_from_current_video)
                 self.after(0, lambda: self._set_running(False))
 
         self._set_running(True)
@@ -296,44 +379,74 @@ class App(tk.Tk):
     def run_trim(self):
         def fn():
             self.save_state()
-            v = studio.resolve_video_path(self.current_var.get())
-            return studio.trim_video(v, Path(self.clip_var.get()))
+            video = self.current_var.get().strip()
+            if not video:
+                raise ValueError("Select a current video first")
+            m = self._ensure_match_entry(video)
+            m["last_action"] = "trim"
+            return studio.trim_video(studio.resolve_video_path(video), Path(m["clip_path"]))
 
         self._run_bg("Trim", fn, next_step="2) Extract frames")
 
     def run_extract(self):
         def fn():
             self.save_state()
-            v = studio.resolve_video_path(self.clip_var.get())
+            video = self.current_var.get().strip()
+            if not video:
+                raise ValueError("Select a current video first")
+            m = self._ensure_match_entry(video)
             fps = float(self.fps_var.get())
-            return studio.extract_frames(v, Path(self.frames_var.get()), fps_out=fps)
+            rc = studio.extract_frames(Path(m["clip_path"]), Path(m["frames_dir"]), fps_out=fps)
+            if rc == 0:
+                m["annotate_completed"] = False
+                m["last_action"] = "extract"
+                save_project(self.state)
+            return rc
 
         self._run_bg("Extract", fn, next_step="3) Annotate")
 
     def run_annotate(self):
         def fn():
             self.save_state()
-            return studio.annotate_frames(
-                Path(self.frames_var.get()),
-                Path(self.ann_var.get()),
+            video = self.current_var.get().strip()
+            if not video:
+                raise ValueError("Select a current video first")
+            m = self._ensure_match_entry(video)
+            rc = studio.annotate_frames(
+                Path(m["frames_dir"]),
+                Path(m["annotations_dir"]),
                 start_index=0,
                 frame_step=int(self.frame_step_var.get()),
                 max_frames=int(self.max_frames_var.get()),
                 annotate_blade=not self.bbox_only_var.get(),
+                skip_existing=True,
             )
+            done, total = _get_progress(Path(m["frames_dir"]), Path(m["annotations_dir"]))
+            m["annotate_completed"] = total > 0 and done >= total
+            m["last_action"] = "annotate"
+            save_project(self.state)
+            return rc
 
         self._run_bg("Annotate", fn, next_step="4) Export YOLO labels")
 
     def run_export(self):
         def fn():
             self.save_state()
+            video = self.current_var.get().strip()
+            if not video:
+                raise ValueError("Select a current video first")
+            m = self._ensure_match_entry(video)
             labels_out = Path(self.data_var.get()) / "labels" / "train"
-            return studio.export_yolo_from_json(
-                Path(self.frames_var.get()),
-                Path(self.ann_var.get()),
+            rc = studio.export_yolo_from_json(
+                Path(m["frames_dir"]),
+                Path(m["annotations_dir"]),
                 labels_out,
                 include_extension_classes=self.include_ext_var.get(),
             )
+            if rc == 0:
+                m["last_action"] = "export"
+                save_project(self.state)
+            return rc
 
         self._run_bg("Export YOLO", fn, next_step="5) Train model")
 
