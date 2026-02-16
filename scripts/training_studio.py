@@ -782,7 +782,6 @@ def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, 
         print("Could not open video")
         return 3
 
-    # optional dohyo limiter
     dohyo = None
     try:
         from models.dohyo import DohyoDetector
@@ -797,8 +796,8 @@ def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, 
     writer = cv2.VideoWriter(str(out_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
     tracks = {
-        1: {"center": None, "vel": (0.0, 0.0), "miss": 0, "bbox": None, "blade": None, "conf": 0.0},
-        2: {"center": None, "vel": (0.0, 0.0), "miss": 0, "bbox": None, "blade": None, "conf": 0.0},
+        1: {"center": None, "vel": (0.0, 0.0), "miss": 0, "bbox": None, "blade": None, "blade_vec": None, "conf": 0.0},
+        2: {"center": None, "vel": (0.0, 0.0), "miss": 0, "bbox": None, "blade": None, "blade_vec": None, "conf": 0.0},
     }
 
     def _inside(mask, cx, cy):
@@ -808,6 +807,25 @@ def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, 
         if tk["center"] is None:
             return None
         return (tk["center"][0] + tk["vel"][0], tk["center"][1] + tk["vel"][1])
+
+    def _norm(vx, vy):
+        n = float(np.hypot(vx, vy))
+        if n < 1e-5:
+            return None
+        return (vx / n, vy / n)
+
+    def _expected_front_dir(tk):
+        v = _norm(tk["vel"][0], tk["vel"][1])
+        if v is not None and np.hypot(tk["vel"][0], tk["vel"][1]) > 1.4:
+            return v
+        if tk["blade_vec"] is not None:
+            bv = _norm(tk["blade_vec"][0], tk["blade_vec"][1])
+            if bv is not None:
+                return bv
+        return None
+
+    def _clamp_pt(x, y):
+        return int(max(0, min(w - 1, x))), int(max(0, min(h - 1, y)))
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     frame_idx = 0
@@ -819,18 +837,20 @@ def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, 
 
         dohyo_mask = None
         dohyo_ellipse = None
+        inner_ellipse = None
         if dohyo is not None:
-            center, radius = dohyo.track(frame)
+            dohyo.track(frame)
             info = getattr(dohyo, "last_detection_info", None)
             if info is not None:
                 cx, cy = [int(v) for v in info["center"]]
                 ax, ay = [max(1, int(v / 2)) for v in info["axes"]]
                 ang = float(info["angle"])
                 dohyo_ellipse = (cx, cy, ax, ay, ang)
+                inner_ellipse = (cx, cy, max(1, int(ax * (154.0 / 164.0))), max(1, int(ay * (154.0 / 164.0))), ang)
                 dohyo_mask = np.zeros((h, w), dtype=np.uint8)
                 cv2.ellipse(dohyo_mask, (cx, cy), (max(1, int(ax * 0.92)), max(1, int(ay * 0.92))), ang, 0, 360, 255, -1)
 
-        res = model.predict(frame, conf=conf, imgsz=imgsz, verbose=False, max_det=12)
+        res = model.predict(frame, conf=conf, imgsz=imgsz, verbose=False, max_det=16)
         raw_robots = []
         raw_blades = []
         if res and len(res[0].boxes) > 0:
@@ -852,7 +872,6 @@ def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, 
                         continue
                     raw_blades.append((x1, y1, x2, y2, cf, cx, cy))
 
-        # keep at most 2 likely robots
         raw_robots = sorted(raw_robots, key=lambda z: z[4], reverse=True)[:6]
 
         used = set()
@@ -885,13 +904,12 @@ def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, 
             if tk["center"] is not None:
                 vx = cx - tk["center"][0]
                 vy = cy - tk["center"][1]
-                tk["vel"] = (0.65 * tk["vel"][0] + 0.35 * vx, 0.65 * tk["vel"][1] + 0.35 * vy)
+                tk["vel"] = (0.70 * tk["vel"][0] + 0.30 * vx, 0.70 * tk["vel"][1] + 0.30 * vy)
             tk["center"] = (cx, cy)
             tk["bbox"] = (x1, y1, x2, y2)
             tk["conf"] = cf
             tk["miss"] = 0
 
-        # initialize missing tracks from remaining detections
         for rid in [1, 2]:
             tk = tracks[rid]
             if tk["center"] is None and raw_robots:
@@ -907,39 +925,64 @@ def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, 
                     used.add(j)
                     break
 
-        # blade assignment or prediction
+        # better blade assignment: choose blades consistent with expected front direction and distance
         for rid in [1, 2]:
             tk = tracks[rid]
-            if tk["center"] is None:
+            if tk["center"] is None or tk["bbox"] is None:
                 continue
             cx, cy = tk["center"]
-            nearest = None
-            best_d = 1e9
-            for bx1, by1, bx2, by2, bcf, bcx, bcy in raw_blades:
-                d = (bcx - cx) ** 2 + (bcy - cy) ** 2
-                if d < best_d:
-                    best_d = d
-                    nearest = (bcx, bcy)
-            if nearest is not None and best_d < 140 * 140:
-                tk["blade"] = nearest
-            else:
-                # predict blade from motion vector if no direct blade detection
-                if tk["bbox"] is not None:
-                    x1, y1, x2, y2 = tk["bbox"]
-                    bw = max(8, x2 - x1)
-                    bh = max(8, y2 - y1)
-                    vx, vy = tk["vel"]
-                    norm = max(1e-3, float(np.hypot(vx, vy)))
-                    if norm < 1.5 and tk["blade"] is not None:
-                        pass
-                    else:
-                        ux, uy = vx / norm, vy / norm
-                        tk["blade"] = (int(cx + ux * max(bw, bh) * 0.45), int(cy + uy * max(bw, bh) * 0.45))
+            x1, y1, x2, y2 = tk["bbox"]
+            bw = max(8, x2 - x1)
+            bh = max(8, y2 - y1)
+            reach = 0.80 * max(bw, bh)
+            exp_dir = _expected_front_dir(tk)
 
-        # draw overlay
+            best = None
+            best_score = -1e9
+            for bx1, by1, bx2, by2, bcf, bcx, bcy in raw_blades:
+                dvx, dvy = (bcx - cx), (bcy - cy)
+                dist = float(np.hypot(dvx, dvy))
+                if dist < 3 or dist > reach * 1.4:
+                    continue
+                dirv = _norm(dvx, dvy)
+                align = 0.0
+                if exp_dir is not None and dirv is not None:
+                    align = exp_dir[0] * dirv[0] + exp_dir[1] * dirv[1]
+                # prefer confident, close-ish, front-aligned candidates
+                score = (2.2 * bcf) + (1.2 * align) - (0.006 * dist)
+                if score > best_score:
+                    best_score = score
+                    best = (bcx, bcy)
+
+            if best is not None:
+                bx, by = best
+                tk["blade"] = (int(bx), int(by))
+                vec = (bx - cx, by - cy)
+                if tk["blade_vec"] is None:
+                    tk["blade_vec"] = vec
+                else:
+                    tk["blade_vec"] = (
+                        0.75 * tk["blade_vec"][0] + 0.25 * vec[0],
+                        0.75 * tk["blade_vec"][1] + 0.25 * vec[1],
+                    )
+            else:
+                # fallback: preserve smoothed blade orientation, then motion vector
+                dirv = _expected_front_dir(tk)
+                if dirv is None:
+                    continue
+                bx = cx + dirv[0] * (0.48 * max(bw, bh))
+                by = cy + dirv[1] * (0.48 * max(bw, bh))
+                tk["blade"] = _clamp_pt(bx, by)
+                tk["blade_vec"] = (tk["blade"][0] - cx, tk["blade"][1] - cy)
+
+        # draw overlays: dohyo contour validation + robots + blade/front
         if dohyo_ellipse is not None:
-            cx, cy, ax, ay, ang = dohyo_ellipse
-            cv2.ellipse(frame, (cx, cy), (ax, ay), ang, 0, 360, (255, 255, 0), 2)
+            dcx, dcy, dax, day, dang = dohyo_ellipse
+            cv2.ellipse(frame, (dcx, dcy), (dax, day), dang, 0, 360, (255, 255, 0), 2)
+            if inner_ellipse is not None:
+                icx, icy, iax, iay, iang = inner_ellipse
+                cv2.ellipse(frame, (icx, icy), (iax, iay), iang, 0, 360, (120, 255, 255), 2)
+            cv2.drawMarker(frame, (dcx, dcy), (255, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=14, thickness=2)
 
         for rid, tk in tracks.items():
             if tk["center"] is None or tk["bbox"] is None:
