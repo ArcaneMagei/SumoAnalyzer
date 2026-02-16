@@ -473,6 +473,35 @@ def infer_video(weights: Path, video: Path, out_video: Path, conf: float = 0.2, 
     return 0
 
 
+def doctor() -> int:
+    """Quick environment and path diagnostics for local setup."""
+    print("== Training Studio Doctor ==")
+    print(f"Python: {sys.version.split()[0]}")
+
+    try:
+        import cv2  # noqa: F401
+        print("OpenCV: OK")
+    except Exception as e:
+        print(f"OpenCV: MISSING ({e})")
+
+    try:
+        import ultralytics  # noqa: F401
+        print("Ultralytics: OK")
+    except Exception as e:
+        print(f"Ultralytics: MISSING ({e})")
+
+    ff = shutil_which("ffmpeg")
+    print(f"FFmpeg: {'OK' if ff else 'MISSING'}{f' ({ff})' if ff else ''}")
+
+    for d in [Path('data/studio/raw_videos'), Path('data/studio/clips'), Path('data/studio/frames'), Path('data/studio/annotations'), Path('artifacts')]:
+        d.mkdir(parents=True, exist_ok=True)
+        ok = os.access(d, os.W_OK)
+        print(f"Writable dir: {d} -> {'OK' if ok else 'NO'}")
+
+    print("Doctor finished.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Robot Sumo Training Studio (all-in-one)")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -513,6 +542,8 @@ def main() -> int:
     p_infer.add_argument("--conf", type=float, default=0.2)
     p_infer.add_argument("--imgsz", type=int, default=960)
 
+    sub.add_parser("doctor", help="check dependencies/paths/local environment")
+
     args = parser.parse_args()
 
     try:
@@ -533,6 +564,8 @@ def main() -> int:
         if args.cmd == "infer-video":
             v = resolve_video_path(args.video)
             return infer_video(Path(args.weights), v, Path(args.out), conf=args.conf, imgsz=args.imgsz)
+        if args.cmd == "doctor":
+            return doctor()
     except FileNotFoundError as e:
         print(e)
         return 2

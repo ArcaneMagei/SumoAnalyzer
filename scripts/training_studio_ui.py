@@ -11,8 +11,18 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+import sys
 
-from scripts import training_studio as studio
+# Support both:
+#   python scripts/training_studio_ui.py
+#   python -m scripts.training_studio_ui
+try:
+    from scripts import training_studio as studio
+except ModuleNotFoundError:
+    project_root = Path(__file__).resolve().parents[1]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    from scripts import training_studio as studio
 
 
 PROJECT_FILE = Path("data/studio/project.json")
@@ -193,7 +203,7 @@ class App(tk.Tk):
                 self._log(f"Done ({title}), rc={rc}")
             except Exception as e:
                 self._log(f"ERROR ({title}): {e}")
-                messagebox.showerror("Error", str(e))
+                self.after(0, lambda: messagebox.showerror("Error", str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
 

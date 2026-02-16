@@ -44,3 +44,12 @@ ffmpeg -y -i "input.mov" -c:v libx264 -pix_fmt yuv420p -c:a aac "input.mp4"
 ## If training fails early
 
 Set in UI/CLI: `workers=0`, `device=cpu`, smaller `imgsz/batch`, then move back to GPU once stable.
+
+
+## Diagnostics
+
+If setup issues occur, run:
+
+```bash
+python scripts/training_studio.py doctor
+```

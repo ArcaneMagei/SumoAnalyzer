@@ -52,3 +52,14 @@ Then switch to GPU/full settings.
 
 - `docs/TRAINING_APP_BLUEPRINT.md`
 - `docs/ANNOTATION_GUIDE.md`
+
+
+## 6) Quick health-check
+
+Run:
+
+```bash
+python scripts/training_studio.py doctor
+```
+
+This checks OpenCV/Ultralytics/FFmpeg and writable project folders.

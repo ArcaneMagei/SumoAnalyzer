@@ -89,3 +89,14 @@ python scripts/training_studio.py export-yolo --frames-dir data/studio/frames --
 python scripts/training_studio.py train --dataset-dir data/robot_dataset --model yolov8n.pt --epochs 120 --imgsz 960 --batch 16 --device 0 --workers 0
 python scripts/training_studio.py infer-video --weights models/weights/robot_sumo.pt --video /path/unseen.mov --out artifacts/infer_unseen.mp4
 ```
+
+
+## UI launch note (Windows)
+
+Both launch modes are supported:
+
+```bash
+python scripts/training_studio_ui.py
+# or
+python -m scripts.training_studio_ui
+```
