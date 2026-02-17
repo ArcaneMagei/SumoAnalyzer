@@ -83,3 +83,5 @@ This checks OpenCV/Ultralytics/FFmpeg and writable project folders.
 - Dohyo contour annotation is now part of frame labeling (manual ellipse with previous-frame reuse), enabling dohyo-aware fine-tuning workflows.
 
 - Test-on-video now prints periodic infer progress in logs and limits robot detections to the detected dohyo area when available.
+
+- Weight discovery is now robust to Ultralytics save-path variants (including `runs/detect/...`), so the trainer will still locate newest `best.pt`/`last.pt` and publish `models/weights/robot_sumo.pt`.

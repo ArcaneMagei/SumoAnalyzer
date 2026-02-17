@@ -14,17 +14,34 @@ class DohyoDetector:
         self.border_width = border_width_cm
         self.total_diameter = expected_diameter_cm + 2.0 * border_width_cm
         self.last_detection_info: Optional[Dict] = None
+        self.smooth_alpha = 0.35
 
     def _white_mask(self, frame: np.ndarray) -> np.ndarray:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        # broad white mask for ring under different lighting
-        m1 = cv2.inRange(hsv, np.array([0, 0, 140]), np.array([180, 80, 255]))
+        # robust white under varied lighting
+        m_hsv = cv2.inRange(hsv, np.array([0, 0, 130]), np.array([180, 95, 255]))
+
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l = lab[:, :, 0]
+        l_blur = cv2.GaussianBlur(l, (0, 0), 2.2)
+        _, m_adapt = cv2.threshold(l_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, m2 = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
-        mask = cv2.bitwise_or(m1, m2)
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+        # emphasize strong bright edges around ring
+        gradx = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
+        grady = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3)
+        mag = cv2.convertScaleAbs(cv2.addWeighted(cv2.convertScaleAbs(gradx), 0.5, cv2.convertScaleAbs(grady), 0.5, 0))
+        _, m_grad = cv2.threshold(mag, 42, 255, cv2.THRESH_BINARY)
+
+        mask = cv2.bitwise_or(m_hsv, m_adapt)
+        mask = cv2.bitwise_and(mask, cv2.bitwise_not(cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 55]))))
+        mask = cv2.bitwise_or(mask, m_grad)
+
+        k1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k2)
         return mask
 
     @staticmethod
@@ -44,7 +61,8 @@ class DohyoDetector:
 
     def _candidate_score(self, cand: Dict, white_mask: np.ndarray, prev: Optional[Dict]) -> float:
         h, w = white_mask.shape[:2]
-        test = np.zeros((h, w), dtype=np.uint8)
+        ring_mask = np.zeros((h, w), dtype=np.uint8)
+        in_mask = np.zeros((h, w), dtype=np.uint8)
         center = cand["center"]
         axes = cand["axes"]
         angle = cand["angle"]
@@ -52,31 +70,38 @@ class DohyoDetector:
         outer_pts = self._ellipse_points(center, axes, angle, scale=1.0)
         inner_scale = self.expected_diameter / self.total_diameter  # 154/164
         inner_pts = self._ellipse_points(center, axes, angle, scale=inner_scale)
+        core_pts = self._ellipse_points(center, axes, angle, scale=inner_scale * 0.82)
 
-        cv2.fillConvexPoly(test, outer_pts.astype(np.int32), 255)
-        cv2.fillConvexPoly(test, inner_pts.astype(np.int32), 0)
+        cv2.fillConvexPoly(ring_mask, outer_pts.astype(np.int32), 255)
+        cv2.fillConvexPoly(ring_mask, inner_pts.astype(np.int32), 0)
+        cv2.fillConvexPoly(in_mask, core_pts.astype(np.int32), 255)
 
-        ring_area = np.count_nonzero(test)
-        if ring_area < 300:
+        ring_area = np.count_nonzero(ring_mask)
+        inner_area = np.count_nonzero(in_mask)
+        if ring_area < 300 or inner_area < 500:
             return -1e9
 
-        white_on_ring = cv2.bitwise_and(white_mask, white_mask, mask=test)
-        whiteness = np.count_nonzero(white_on_ring) / float(ring_area)
+        white_on_ring = cv2.bitwise_and(white_mask, white_mask, mask=ring_mask)
+        white_on_inner = cv2.bitwise_and(white_mask, white_mask, mask=in_mask)
+        whiteness_ring = np.count_nonzero(white_on_ring) / float(ring_area)
+        whiteness_inner = np.count_nonzero(white_on_inner) / float(inner_area)
 
-        # geometric sanity (ellipse should be reasonably large and not absurdly thin)
+        # ring should be brighter than interior (black dohyo center)
+        ring_contrast = whiteness_ring - 0.65 * whiteness_inner
+
         d1, d2 = axes
         ar = max(d1, d2) / (min(d1, d2) + 1e-6)
-        shape_penalty = 0.0 if ar < 3.0 else -0.3 * (ar - 3.0)
+        shape_penalty = 0.0 if ar < 4.0 else -0.22 * (ar - 4.0)
 
-        score = whiteness + shape_penalty
+        score = (1.25 * whiteness_ring) + (1.60 * ring_contrast) + shape_penalty
 
         if prev is not None:
             pcx, pcy = prev["center"]
             dc = np.hypot(center[0] - pcx, center[1] - pcy)
             pd1, pd2 = prev["axes"]
             dd = abs(d1 - pd1) + abs(d2 - pd2)
-            score -= 0.003 * dc
-            score -= 0.0015 * dd
+            score -= 0.0028 * dc
+            score -= 0.0012 * dd
 
         return score
 
@@ -159,6 +184,17 @@ class DohyoDetector:
         axes = (float(best["axes"][0]), float(best["axes"][1]))
         angle = float(best["angle"])
         radius = int(round((axes[0] + axes[1]) / 4.0))
+
+        if prev is not None:
+            # temporal smoothing to stabilize noisy edge fluctuations
+            pcx, pcy = prev["center"]
+            pd1, pd2 = prev["axes"]
+            pangle = float(prev.get("angle", angle))
+            a = self.smooth_alpha
+            center = (int(round((1 - a) * pcx + a * center[0])), int(round((1 - a) * pcy + a * center[1])))
+            axes = ((1 - a) * pd1 + a * axes[0], (1 - a) * pd2 + a * axes[1])
+            angle = float((1 - a) * pangle + a * angle)
+            radius = int(round((axes[0] + axes[1]) / 4.0))
 
         self.last_detection_info = {
             "shape": "ellipse",

@@ -7,6 +7,7 @@ machines where dataloader workers can crash at epoch start.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import sys
 
@@ -112,21 +113,47 @@ def validate_labels(dataset_dir: Path, num_classes: int) -> None:
 
 
 
-def _find_latest_weights(project_dir: Path, run_name: str) -> Path | None:
+def _find_latest_weights(project_dir: Path, run_name: str, save_dir_hint: Path | None = None) -> Path | None:
+    """Find newest best/last checkpoint across common Ultralytics layouts."""
     candidates = []
+
+    # canonical expectation
     preferred = project_dir / run_name / "weights"
     for p in [preferred / "best.pt", preferred / "last.pt"]:
         if p.exists():
             candidates.append(p)
 
-    for pat in ["**/weights/best.pt", "**/weights/last.pt"]:
-        for p in project_dir.glob(pat):
-            if p.is_file():
+    # if train() returned save_dir, trust it first
+    if save_dir_hint is not None:
+        hint = Path(save_dir_hint)
+        for p in [hint / "weights" / "best.pt", hint / "weights" / "last.pt", hint / "best.pt", hint / "last.pt"]:
+            if p.exists():
                 candidates.append(p)
+
+    # search under requested project dir
+    if project_dir.exists():
+        for pat in ["**/weights/best.pt", "**/weights/last.pt"]:
+            for p in project_dir.glob(pat):
+                if p.is_file():
+                    candidates.append(p)
+
+    # search common alt roots used by ultralytics detect task
+    for alt in [Path("runs"), Path("runs/detect"), Path.cwd()]:
+        if not alt.exists():
+            continue
+        for pat in ["**/weights/best.pt", "**/weights/last.pt"]:
+            for p in alt.glob(pat):
+                if not p.is_file():
+                    continue
+                # prioritize paths containing run name/project hint
+                s = str(p).lower()
+                if run_name.lower() in s or project_dir.name.lower() in s:
+                    candidates.append(p)
 
     if not candidates:
         return None
-    uniq = list({str(c): c for c in candidates}.values())
+
+    uniq = list({str(c.resolve()): c.resolve() for c in candidates}.values())
     uniq.sort(key=lambda x: x.stat().st_mtime, reverse=True)
     return uniq[0]
 
@@ -186,8 +213,10 @@ def main() -> int:
     print(f"Workers: {args.workers} | Cache: {args.cache}")
 
     model = YOLO(args.model)
+    train_result = None
+    save_dir_hint = None
     try:
-        model.train(
+        train_result = model.train(
             data=str(data_yaml),
             epochs=args.epochs,
             imgsz=args.imgsz,
@@ -202,6 +231,12 @@ def main() -> int:
             save_period=args.save_period,
             resume=args.resume,
         )
+        try:
+            save_dir_hint = Path(getattr(model, "trainer", None).save_dir) if getattr(model, "trainer", None) is not None else None
+        except Exception:
+            save_dir_hint = None
+        if save_dir_hint is not None:
+            print(f"Ultralytics save_dir: {save_dir_hint}")
     except Exception as e:
         print("\nTraining crashed.", file=sys.stderr)
         print("Most common fixes:", file=sys.stderr)
@@ -215,10 +250,13 @@ def main() -> int:
     target = Path("models/weights/robot_sumo.pt")
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    latest = _find_latest_weights(Path(args.project), args.name)
+    latest = _find_latest_weights(Path(args.project), args.name, save_dir_hint=save_dir_hint)
     if latest is None:
         print("Training finished, but no weights found (best.pt/last.pt missing).", file=sys.stderr)
-        print(f"Searched in: {Path(args.project).resolve()}", file=sys.stderr)
+        print(f"Searched project root: {Path(args.project).resolve()}", file=sys.stderr)
+        print(f"Searched cwd recursively: {Path.cwd().resolve()}", file=sys.stderr)
+        if save_dir_hint is not None:
+            print(f"Ultralytics save_dir hint: {save_dir_hint}", file=sys.stderr)
         return 4
 
     target.write_bytes(latest.read_bytes())
