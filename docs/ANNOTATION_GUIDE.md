@@ -63,3 +63,6 @@ python scripts/training_studio.py doctor
 - When reopening annotation, the app logs resume state (`already annotated X/Y`) and continues from unannotated frames by default.
 
 - Each annotation frame now includes a **dohyo ellipse** step (draw ROI around dohyo, or reuse previous ellipse) before robot labels.
+
+- Review phase now supports quick edits: `1` edit Robot 1, `2` edit Robot 2, `e` edit dohyo ellipse, `r` redo current frame.
+- Annotation can use AI prefill (when `models/weights/robot_sumo.pt` exists): press `A` on robot step to accept AI-suggested box/center quickly.

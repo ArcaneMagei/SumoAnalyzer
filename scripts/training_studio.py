@@ -149,13 +149,30 @@ def trim_video(video: Path, out_clip: Path) -> int:
         cap.release()
         return 3
 
-    start_f, end_f, cur = 0, total - 1, 0
+    trim_meta = out_clip.with_suffix(out_clip.suffix + ".trim.json")
+    start_f, end_f = 0, total - 1
+    if trim_meta.exists():
+        try:
+            meta = json.loads(trim_meta.read_text(encoding="utf-8"))
+            start_f = int(meta.get("start_f", start_f))
+            end_f = int(meta.get("end_f", end_f))
+            start_f = max(0, min(total - 1, start_f))
+            end_f = max(start_f, min(total - 1, end_f))
+            print(f"Loaded previous trim: IN={start_f} OUT={end_f}")
+        except Exception:
+            pass
+
+    cur = start_f
     _named_window("Trim Studio")
-    cv2.createTrackbar("frame", "Trim Studio", 0, max(1, total - 1), lambda x: None)
+    cv2.createTrackbar("frame", "Trim Studio", int(cur), max(1, total - 1), lambda x: None)
 
     print("Trim controls: j/l +/-1, a/d +/-15, i=set IN, o=set OUT, s=save, q=quit")
+    saved = False
 
     while True:
+        if cv2.getWindowProperty("Trim Studio", cv2.WND_PROP_VISIBLE) < 1:
+            break
+
         cv2.setTrackbarPos("frame", "Trim Studio", int(cur))
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(cur))
         ok, frame = cap.read()
@@ -170,9 +187,7 @@ def trim_video(video: Path, out_clip: Path) -> int:
 
         k = cv2.waitKey(0) & 0xFF
         if k == ord("q"):
-            cap.release()
-            cv2.destroyAllWindows()
-            return 0
+            break
         if k == ord("j"):
             cur = max(0, cur - 1)
         elif k == ord("l"):
@@ -186,23 +201,27 @@ def trim_video(video: Path, out_clip: Path) -> int:
         elif k == ord("o"):
             end_f = max(cur, start_f)
         elif k == ord("s"):
+            saved = True
             break
-        else:
-            cur = int(cv2.getTrackbarPos("frame", "Trim Studio"))
 
-    out_clip.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(str(out_clip), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_f))
-    for _ in range(start_f, end_f + 1):
-        ok, frame = cap.read()
-        if not ok:
-            break
-        writer.write(frame)
+    if saved:
+        out_clip.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(str(out_clip), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_f))
+        for _ in range(start_f, end_f + 1):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            writer.write(frame)
+        writer.release()
 
-    writer.release()
+        trim_meta.write_text(json.dumps({"start_f": int(start_f), "end_f": int(end_f), "total": int(total)}, indent=2), encoding="utf-8")
+        print(f"Saved clip: {out_clip} ({start_f}..{end_f})")
+    else:
+        print("Trim canceled (no new save).")
+
     cap.release()
     cv2.destroyAllWindows()
-    print(f"Saved clip: {out_clip} ({start_f}..{end_f})")
     return 0
 
 
@@ -387,28 +406,166 @@ def _extension_boxes(rb: dict, w: int, h: int) -> List[Tuple[int, int, int, int,
 
 
 
-def _pick_dohyo_ellipse(frame, window_name: str, frame_progress: str, prev_ellipse: Optional[Tuple[float, float, float, float, float]] = None) -> Optional[Tuple[float, float, float, float, float]]:
-    """Manual dohyo ellipse annotation by ROI with optional previous reuse."""
+def _pick_dohyo_ellipse(
+    frame,
+    window_name: str,
+    frame_progress: str,
+    prev_ellipse: Optional[Tuple[float, float, float, float, float]] = None,
+    auto_ellipse: Optional[Tuple[float, float, float, float, float]] = None,
+) -> Optional[Tuple[float, float, float, float, float]]:
+    """Pick/adjust dohyo ellipse with auto+prev options."""
     cv2 = require_cv2()
-    if prev_ellipse is not None:
-        vis = frame.copy()
-        cx, cy, aw, ah, ang = prev_ellipse
-        cv2.ellipse(vis, (int(cx), int(cy)), (int(aw / 2), int(ah / 2)), float(ang), 0, 360, (200, 255, 0), 2)
-        _overlay_lines(vis, [frame_progress, "Dohyo step: G=use previous ellipse | Enter=draw ROI ellipse"])
-        cv2.imshow(window_name, vis)
-        k = cv2.waitKey(0) & 0xFF
-        if k in (ord('g'), ord('G')):
-            return prev_ellipse
 
     vis = frame.copy()
-    _overlay_lines(vis, [frame_progress, "Dohyo step: draw ROI around dohyo (Enter=confirm, ESC=skip)"])
-    roi = cv2.selectROI(window_name, vis, fromCenter=False, showCrosshair=True)
+    if auto_ellipse is not None:
+        cx, cy, aw, ah, ang = auto_ellipse
+        cv2.ellipse(vis, (int(cx), int(cy)), (max(1, int(aw / 2)), max(1, int(ah / 2))), float(ang), 0, 360, (80, 255, 80), 2)
+    if prev_ellipse is not None:
+        cx, cy, aw, ah, ang = prev_ellipse
+        cv2.ellipse(vis, (int(cx), int(cy)), (max(1, int(aw / 2)), max(1, int(ah / 2))), float(ang), 0, 360, (200, 255, 0), 2)
+
+    _overlay_lines(
+        vis,
+        [
+            frame_progress,
+            "Dohyo: A=accept auto | G=use previous | Enter=draw ROI | E=edit current",
+        ],
+    )
+    cv2.imshow(window_name, vis)
+    k = cv2.waitKey(0) & 0xFF
+
+    if k in (ord('a'), ord('A')) and auto_ellipse is not None:
+        return auto_ellipse
+    if k in (ord('g'), ord('G')) and prev_ellipse is not None:
+        return prev_ellipse
+
+    base = auto_ellipse if auto_ellipse is not None else prev_ellipse
+    if base is not None and k in (ord('e'), ord('E')):
+        cx, cy, aw, ah, ang = base
+        x = max(0, int(cx - aw / 2))
+        y = max(0, int(cy - ah / 2))
+        w = int(aw)
+        h = int(ah)
+        roi = cv2.selectROI(window_name, frame, fromCenter=False, showCrosshair=True)
+        rx, ry, rw, rh = [int(v) for v in roi]
+        if rw > 0 and rh > 0:
+            x, y, w, h = rx, ry, rw, rh
+        return (float(x + w / 2.0), float(y + h / 2.0), float(w), float(h), float(ang))
+
+    roi_vis = frame.copy()
+    _overlay_lines(roi_vis, [frame_progress, "Dohyo: draw ROI around ring (Enter confirm, ESC keep previous/auto)"])
+    roi = cv2.selectROI(window_name, roi_vis, fromCenter=False, showCrosshair=True)
     x, y, w, h = [int(v) for v in roi]
     if w <= 0 or h <= 0:
-        return prev_ellipse
-    cx = float(x + w / 2.0)
-    cy = float(y + h / 2.0)
-    return (cx, cy, float(w), float(h), 0.0)
+        return auto_ellipse if auto_ellipse is not None else prev_ellipse
+    return (float(x + w / 2.0), float(y + h / 2.0), float(w), float(h), 0.0)
+
+
+def _find_robot_by_id(labels: List[RobotLabel], rid: int) -> Optional[RobotLabel]:
+    for lb in labels:
+        if lb.robot_id == rid:
+            return lb
+    return None
+
+
+def _annotate_one_robot(
+    frame,
+    frame_progress: str,
+    window_name: str,
+    rid: int,
+    annotate_blade: bool,
+    prev_robot: Optional[RobotLabel] = None,
+    ai_robot: Optional[RobotLabel] = None,
+) -> Optional[RobotLabel]:
+    cv2 = require_cv2()
+    h, w = frame.shape[:2]
+
+    prompt = frame.copy()
+    lines = [frame_progress, f"Robot {rid}/2: Enter=manual bbox"]
+    if prev_robot is not None:
+        lines.append("G=use previous robot annotation")
+    if ai_robot is not None:
+        lines.append("A=use AI prefill")
+    _overlay_lines(prompt, lines)
+    cv2.imshow(window_name, prompt)
+    k = cv2.waitKey(0) & 0xFF
+
+    if k in (ord('g'), ord('G')) and prev_robot is not None:
+        return RobotLabel(**asdict(prev_robot))
+    if k in (ord('a'), ord('A')) and ai_robot is not None:
+        return RobotLabel(**asdict(ai_robot))
+
+    roi_src = frame.copy()
+    _overlay_lines(roi_src, [frame_progress, f"Robot {rid}/2: draw BODY bbox, Enter=confirm, ESC=skip robot"])
+    roi = cv2.selectROI(window_name, roi_src, fromCenter=False, showCrosshair=True)
+    x, y, bw, bh = [int(v) for v in roi]
+    if bw <= 0 or bh <= 0:
+        return None
+
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(w - 1, x + bw), min(h - 1, y + bh)
+    default_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+
+    panel_center = frame.copy()
+    cv2.rectangle(panel_center, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.circle(panel_center, default_center, 4, (0, 255, 0), -1)
+    center = _point_picker(panel_center, window_name, color=(0, 255, 0), prompt=f"Robot {rid}/2: click BODY center.", frame_progress=frame_progress)
+
+    bl = br = mid = None
+    heading = 0.0
+    blade_width = 0.0
+    if annotate_blade:
+        panel = frame.copy()
+        cv2.rectangle(panel, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        bl = _point_picker(panel, window_name, color=(255, 200, 0), prompt=f"Robot {rid}/2: click blade LEFT endpoint.", frame_progress=frame_progress)
+
+        panel2 = frame.copy()
+        cv2.rectangle(panel2, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.circle(panel2, bl, 4, (255, 200, 0), -1)
+        br = _point_picker(panel2, window_name, color=(0, 255, 255), prompt=f"Robot {rid}/2: click blade RIGHT endpoint.", frame_progress=frame_progress)
+        bl, br = _line_editor(panel2, window_name, bl, br, frame_progress=frame_progress, prompt=f"Robot {rid}/2: drag points to align blade.")
+        mid = ((bl[0] + br[0]) // 2, (bl[1] + br[1]) // 2)
+        heading = _heading_deg(center, mid)
+        blade_width = float(((br[0] - bl[0]) ** 2 + (br[1] - bl[1]) ** 2) ** 0.5)
+
+    return RobotLabel(
+        robot_id=rid,
+        class_name="robot",
+        bbox_xyxy=(x1, y1, x2, y2),
+        center_xy=center,
+        blade_left_xy=bl,
+        blade_right_xy=br,
+        blade_mid_xy=mid,
+        heading_deg=heading,
+        blade_width_px=blade_width,
+        extension_type="none",
+        extension_side="none",
+        visible=True,
+    )
+
+
+def _ai_prefill_robots(frame, model) -> List[RobotLabel]:
+    if model is None:
+        return []
+    out = []
+    try:
+        pred = model.predict(frame, conf=0.25, imgsz=960, verbose=False, max_det=6)
+        boxes = []
+        if pred and len(pred[0].boxes) > 0:
+            for b in pred[0].boxes:
+                cls = int(b.cls[0]) if b.cls is not None else -1
+                if cls != 0:
+                    continue
+                x1, y1, x2, y2 = b.xyxy[0].cpu().numpy().astype(int)
+                cf = float(b.conf[0])
+                boxes.append((cf, x1, y1, x2, y2))
+        boxes.sort(reverse=True)
+        for rid, (_, x1, y1, x2, y2) in zip([1, 2], boxes[:2]):
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            out.append(RobotLabel(robot_id=rid, class_name="robot", bbox_xyxy=(x1, y1, x2, y2), center_xy=(cx, cy)))
+    except Exception:
+        return []
+    return out
 
 
 def annotate_frames(
@@ -442,15 +599,31 @@ def annotate_frames(
             print("All selected frames already annotated. Nothing to do.")
             return 0
 
-    print("Annotation controls:")
-    print("  A=annotate current frame | P=propagate previous labels | S=skip frame")
-    print("  F=finish this match now | X=exit annotator")
-    print("  Review: Enter=approve frame | R=redo frame")
+    print("Annotation controls: A annotate / P previous frame / S skip / F finish / X exit")
+    print("Review controls: Enter approve, R redo, 1/2 edit robot, E edit dohyo")
 
     window_name = "Annotation Studio"
     _named_window(window_name)
+
     prev_labels: List[RobotLabel] = []
     prev_dohyo: Optional[Tuple[float, float, float, float, float]] = None
+
+    # optional auto helpers
+    auto_dohyo = None
+    try:
+        from models.dohyo import DohyoDetector
+        auto_dohyo = DohyoDetector()
+    except Exception:
+        auto_dohyo = None
+
+    yolo_model = None
+    try:
+        from ultralytics import YOLO
+        w = Path("models/weights/robot_sumo.pt")
+        if w.exists():
+            yolo_model = YOLO(str(w))
+    except Exception:
+        yolo_model = None
 
     for i, img_path in enumerate(selected, start=1):
         frame = cv2.imread(str(img_path))
@@ -461,168 +634,107 @@ def annotate_frames(
 
         while True:
             choice_img = frame.copy()
-            _overlay_lines(
-                choice_img,
-                [
-                    frame_progress,
-                    "A=Annotate | P=Use previous labels | S=Skip | F=Finish match | X=Exit",
-                ],
-            )
+            _overlay_lines(choice_img, [frame_progress, "A=Annotate | P=Use previous | S=Skip | F=Finish | X=Exit"])
             cv2.imshow(window_name, choice_img)
             key = cv2.waitKey(0) & 0xFF
-            if key in (ord("x"), ord("X")):
+            if key in (ord('x'), ord('X')):
                 cv2.destroyWindow(window_name)
                 return 0
-            if key in (ord("f"), ord("F")):
+            if key in (ord('f'), ord('F')):
                 cv2.destroyWindow(window_name)
                 return 0
-            if key in (ord("s"), ord("S")):
+            if key in (ord('s'), ord('S')):
                 print(f"[{i}/{len(selected)}] skipped {img_path.name}")
                 break
 
-            if key in (ord("p"), ord("P")) and prev_labels:
+            auto_ellipse = None
+            if auto_dohyo is not None:
+                try:
+                    auto_dohyo.track(frame)
+                    info = getattr(auto_dohyo, "last_detection_info", None)
+                    if info is not None:
+                        cx, cy = info["center"]
+                        aw, ah = info["axes"]
+                        auto_ellipse = (float(cx), float(cy), float(aw), float(ah), float(info["angle"]))
+                except Exception:
+                    auto_ellipse = None
+
+            if key in (ord('p'), ord('P')) and prev_labels:
                 labels = [RobotLabel(**asdict(lb)) for lb in prev_labels]
                 dohyo_ellipse = prev_dohyo
             else:
                 labels = []
-                dohyo_ellipse = _pick_dohyo_ellipse(frame, window_name, frame_progress, prev_ellipse=prev_dohyo)
+                ai_pref = _ai_prefill_robots(frame, yolo_model)
+                dohyo_ellipse = _pick_dohyo_ellipse(frame, window_name, frame_progress, prev_ellipse=prev_dohyo, auto_ellipse=auto_ellipse)
+
                 for rid in [1, 2]:
-                    roi_src = frame.copy()
-                    _overlay_lines(
-                        roi_src,
-                        [
-                            frame_progress,
-                            f"Robot {rid}/2: draw BODY bbox, Enter=confirm, ESC=skip robot",
-                        ],
-                    )
-                    roi = cv2.selectROI(window_name, roi_src, fromCenter=False, showCrosshair=True)
-                    x, y, bw, bh = [int(v) for v in roi]
-                    if bw <= 0 or bh <= 0:
-                        continue
+                    prev_robot = _find_robot_by_id(prev_labels, rid)
+                    ai_robot = _find_robot_by_id(ai_pref, rid)
+                    rb = _annotate_one_robot(frame, frame_progress, window_name, rid, annotate_blade, prev_robot=prev_robot, ai_robot=ai_robot)
+                    if rb is not None:
+                        labels = [l for l in labels if l.robot_id != rid]
+                        labels.append(rb)
 
-                    x1, y1 = max(0, x), max(0, y)
-                    x2, y2 = min(w - 1, x + bw), min(h - 1, y + bh)
-                    default_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+            labels = sorted(labels, key=lambda z: z.robot_id)
 
-                    panel_center = frame.copy()
-                    cv2.rectangle(panel_center, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.circle(panel_center, default_center, 4, (0, 255, 0), -1)
-                    center = _point_picker(
-                        panel_center,
-                        window_name,
-                        color=(0, 255, 0),
-                        prompt=f"Robot {rid}/2: click BODY center (chassis center).",
-                        frame_progress=frame_progress,
-                    )
+            # review + optional editing
+            while True:
+                review = frame.copy()
+                if dohyo_ellipse is not None:
+                    cx, cy, aw, ah, ang = dohyo_ellipse
+                    cv2.ellipse(review, (int(cx), int(cy)), (max(1, int(aw / 2)), max(1, int(ah / 2))), float(ang), 0, 360, (255, 255, 0), 2)
 
-                    bl = br = mid = None
-                    heading = 0.0
-                    blade_width = 0.0
-                    if annotate_blade:
-                        panel = frame.copy()
-                        cv2.rectangle(panel, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        bl = _point_picker(
-                            panel,
-                            window_name,
-                            color=(255, 200, 0),
-                            prompt=f"Robot {rid}/2: click blade LEFT endpoint.",
-                            frame_progress=frame_progress,
-                        )
+                for lb in labels:
+                    x1, y1, x2, y2 = lb.bbox_xyxy
+                    cv2.rectangle(review, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    if lb.blade_left_xy and lb.blade_right_xy:
+                        cv2.circle(review, lb.blade_left_xy, 4, (255, 200, 0), -1)
+                        cv2.circle(review, lb.blade_right_xy, 4, (0, 255, 255), -1)
+                        cv2.line(review, lb.blade_left_xy, lb.blade_right_xy, (255, 255, 0), 2)
+                    if lb.center_xy and lb.blade_mid_xy:
+                        cv2.line(review, lb.center_xy, lb.blade_mid_xy, (255, 255, 0), 2)
+                    cv2.putText(review, f"R{lb.robot_id} heading={lb.heading_deg:.1f}", (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
-                        panel2 = frame.copy()
-                        cv2.rectangle(panel2, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.circle(panel2, bl, 4, (255, 200, 0), -1)
-                        br = _point_picker(
-                            panel2,
-                            window_name,
-                            color=(0, 255, 255),
-                            prompt=f"Robot {rid}/2: click blade RIGHT endpoint.",
-                            frame_progress=frame_progress,
-                        )
-                        bl, br = _line_editor(
-                            panel2,
-                            window_name,
-                            bl,
-                            br,
-                            frame_progress=frame_progress,
-                            prompt=f"Robot {rid}/2: drag points to align blade, Enter=confirm.",
-                        )
-                        mid = ((bl[0] + br[0]) // 2, (bl[1] + br[1]) // 2)
-                        heading = _heading_deg(center, mid)
-                        blade_width = float(((br[0] - bl[0]) ** 2 + (br[1] - bl[1]) ** 2) ** 0.5)
+                _overlay_lines(review, [frame_progress, "Review: Enter=Approve | R=Redo | 1/2 Edit robot | E Edit dohyo | S Skip"])
+                cv2.imshow(window_name, review)
+                rk = cv2.waitKey(0) & 0xFF
+                if rk in (13, 32):
+                    rec = FrameLabel(image_name=img_path.name, width=w, height=h, robots=labels, dohyo_ellipse=dohyo_ellipse)
+                    outp = out_json_dir / f"{img_path.stem}.json"
+                    if outp.exists() and skip_existing:
+                        print(f"[{i}/{len(selected)}] exists, skipped write {outp.name}")
+                    else:
+                        outp.write_text(json.dumps(asdict(rec), indent=2), encoding="utf-8")
+                        print(f"[{i}/{len(selected)}] approved {outp.name}")
+                    prev_labels = [RobotLabel(**asdict(lb)) for lb in labels]
+                    prev_dohyo = dohyo_ellipse
+                    break
+                if rk in (ord('s'), ord('S')):
+                    print(f"[{i}/{len(selected)}] skipped {img_path.name}")
+                    break
+                if rk in (ord('r'), ord('R')):
+                    break
+                if rk in (ord('e'), ord('E')):
+                    dohyo_ellipse = _pick_dohyo_ellipse(frame, window_name, frame_progress, prev_ellipse=dohyo_ellipse, auto_ellipse=auto_ellipse)
+                    continue
+                if rk in (ord('1'), ord('2')):
+                    rid = 1 if rk == ord('1') else 2
+                    prev_robot = _find_robot_by_id(prev_labels, rid)
+                    ai_pref = _ai_prefill_robots(frame, yolo_model)
+                    ai_robot = _find_robot_by_id(ai_pref, rid)
+                    edited = _annotate_one_robot(frame, frame_progress, window_name, rid, annotate_blade, prev_robot=prev_robot, ai_robot=ai_robot)
+                    if edited is not None:
+                        labels = [l for l in labels if l.robot_id != rid]
+                        labels.append(edited)
+                        labels = sorted(labels, key=lambda z: z.robot_id)
+                    continue
+                if rk in (ord('f'), ord('F'), ord('x'), ord('X')):
+                    cv2.destroyWindow(window_name)
+                    return 0
 
-                    labels.append(
-                        RobotLabel(
-                            robot_id=rid,
-                            class_name="robot",
-                            bbox_xyxy=(x1, y1, x2, y2),
-                            center_xy=center,
-                            blade_left_xy=bl,
-                            blade_right_xy=br,
-                            blade_mid_xy=mid,
-                            heading_deg=heading,
-                            blade_width_px=blade_width,
-                            extension_type="none",
-                            extension_side="none",
-                            visible=True,
-                        )
-                    )
-
-            review = frame.copy()
-            for lb in labels:
-                x1, y1, x2, y2 = lb.bbox_xyxy
-                cv2.rectangle(review, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                if lb.blade_left_xy and lb.blade_right_xy:
-                    cv2.circle(review, lb.blade_left_xy, 4, (255, 200, 0), -1)
-                    cv2.circle(review, lb.blade_right_xy, 4, (0, 255, 255), -1)
-                    cv2.line(review, lb.blade_left_xy, lb.blade_right_xy, (255, 255, 0), 2)
-                if lb.center_xy and lb.blade_mid_xy:
-                    cv2.line(review, lb.center_xy, lb.blade_mid_xy, (255, 255, 0), 2)
-                cv2.putText(
-                    review,
-                    f"R{lb.robot_id} heading={lb.heading_deg:.1f}",
-                    (x1, max(20, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (0, 255, 0),
-                    2,
-                )
-
-            if dohyo_ellipse is not None:
-                cx, cy, aw, ah, ang = dohyo_ellipse
-                cv2.ellipse(review, (int(cx), int(cy)), (max(1, int(aw / 2)), max(1, int(ah / 2))), float(ang), 0, 360, (255, 255, 0), 2)
-            _overlay_lines(
-                review,
-                [
-                    frame_progress,
-                    "Review: Enter=Approve | R=Redo | S=Skip | F=Finish match | X=Exit",
-                ],
-            )
-            cv2.imshow(window_name, review)
-            key = cv2.waitKey(0) & 0xFF
-            if key in (ord("x"), ord("X")):
-                cv2.destroyWindow(window_name)
-                return 0
-            if key in (ord("f"), ord("F")):
-                cv2.destroyWindow(window_name)
-                return 0
-            if key in (ord("s"), ord("S")):
-                print(f"[{i}/{len(selected)}] skipped {img_path.name}")
-                break
-            if key in (ord("r"), ord("R")):
+            # if redo frame, restart annotation choice
+            if rk in (ord('r'), ord('R')):
                 continue
-            if key not in (13, 32):
-                continue
-
-            rec = FrameLabel(image_name=img_path.name, width=w, height=h, robots=labels, dohyo_ellipse=dohyo_ellipse)
-            outp = out_json_dir / f"{img_path.stem}.json"
-            if outp.exists() and skip_existing:
-                print(f"[{i}/{len(selected)}] exists, skipped write {outp.name}")
-            else:
-                outp.write_text(json.dumps(asdict(rec), indent=2), encoding="utf-8")
-                print(f"[{i}/{len(selected)}] approved {outp.name}")
-            prev_labels = [RobotLabel(**asdict(lb)) for lb in labels]
-            prev_dohyo = dohyo_ellipse
             break
 
     cv2.destroyWindow(window_name)

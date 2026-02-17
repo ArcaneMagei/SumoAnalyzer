@@ -135,11 +135,12 @@ class App(tk.Tk):
 
         self.video_list = tk.Listbox(top, height=7)
         self.video_list.pack(side="left", fill="x", expand=True)
+        self.video_list.bind("<<ListboxSelect>>", self._on_video_select)
+        self._video_index_to_path = {}
 
         btns = ttk.Frame(top)
         btns.pack(side="left", padx=8)
         ttk.Button(btns, text="Add videos", command=self.add_videos).pack(fill="x", pady=2)
-        ttk.Button(btns, text="Set selected", command=self.set_selected_video).pack(fill="x", pady=2)
         ttk.Button(btns, text="Remove selected", command=self.remove_selected_video).pack(fill="x", pady=2)
 
         self.status_var = tk.StringVar(value="No video selected")
@@ -253,8 +254,14 @@ class App(tk.Tk):
 
     def _refresh_videos(self):
         self.video_list.delete(0, tk.END)
-        for v in self.state.get("videos", []):
-            self.video_list.insert(tk.END, v)
+        self._video_index_to_path = {}
+        for idx, v in enumerate(self.state.get("videos", [])):
+            m = self.state.get("matches", {}).get(v, {})
+            done, total = _get_progress(Path(m.get("frames_dir", "")), Path(m.get("annotations_dir", "")))
+            mark = "✅" if (total > 0 and done >= total) else "🟨"
+            label = f"{mark} {done}/{total}  {Path(v).name}"
+            self._video_index_to_path[idx] = v
+            self.video_list.insert(tk.END, label)
 
     def _log(self, msg: str):
         self.log.insert(tk.END, msg + "\n")
@@ -317,20 +324,28 @@ class App(tk.Tk):
         self._refresh_videos()
         self.save_state()
 
-    def set_selected_video(self):
+
+    def _on_video_select(self, event=None):
         sel = self.video_list.curselection()
         if not sel:
             return
-        v = self.video_list.get(sel[0])
+        v = self._video_index_to_path.get(sel[0])
+        if not v:
+            return
         self.current_var.set(v)
         self._sync_ui_from_current_video()
         self.save_state()
+
+    def set_selected_video(self):
+        self._on_video_select()
 
     def remove_selected_video(self):
         sel = self.video_list.curselection()
         if not sel:
             return
-        v = self.video_list.get(sel[0])
+        v = self._video_index_to_path.get(sel[0])
+        if not v:
+            return
         self.state["videos"] = [x for x in self.state.get("videos", []) if x != v]
         self.state.setdefault("matches", {}).pop(v, None)
         if self.current_var.get() == v:

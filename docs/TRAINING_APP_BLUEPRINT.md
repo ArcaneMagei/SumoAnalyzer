@@ -108,3 +108,5 @@ Each selected video gets its own workspace in `data/studio/matches/<match_id>/` 
 
 ## Multi-match dataset building
 Use the UI option **Export ALL prepared matches** to merge annotations from every prepared match into a single YOLO dataset before retraining.
+
+- Video Library now displays per-video annotation progress (`x/y`) with a completion checkmark, and selecting a row auto-activates that video.
