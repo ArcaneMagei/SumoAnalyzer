@@ -15,6 +15,31 @@ class DohyoDetector:
         self.total_diameter = expected_diameter_cm + 2.0 * border_width_cm
         self.last_detection_info: Optional[Dict] = None
         self.smooth_alpha = 0.35
+        self.manual_override: Optional[Dict] = None
+        self.lock_to_manual = False
+
+    def set_manual_ellipse(self, center: Tuple[int, int], axes: Tuple[float, float], angle: float, lock: bool = True) -> None:
+        """Force dohyo geometry from user calibration.
+
+        Args:
+            center: Ellipse center in image pixels.
+            axes: Full ellipse diameters (major/minor) in image pixels.
+            angle: Ellipse rotation in degrees.
+            lock: If True, tracking always returns this geometry.
+        """
+        radius = int(round((axes[0] + axes[1]) / 4.0))
+        self.manual_override = {
+            "shape": "ellipse",
+            "center": (int(center[0]), int(center[1])),
+            "axes": (float(axes[0]), float(axes[1])),
+            "angle": float(angle),
+            "radius": radius,
+            "score": 999.0,
+            "inner_scale": self.expected_diameter / self.total_diameter,
+            "manual": True,
+        }
+        self.lock_to_manual = lock
+        self.last_detection_info = dict(self.manual_override)
 
     def _white_mask(self, frame: np.ndarray) -> np.ndarray:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -158,6 +183,10 @@ class DohyoDetector:
         return cands
 
     def detect(self, frame: np.ndarray) -> Tuple[Optional[Tuple[int, int]], Optional[int]]:
+        if self.manual_override is not None and self.lock_to_manual:
+            self.last_detection_info = dict(self.manual_override)
+            return self.last_detection_info["center"], self.last_detection_info["radius"]
+
         if frame is None or frame.size == 0:
             self.last_detection_info = None
             return None, None

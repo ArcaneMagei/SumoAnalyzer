@@ -18,6 +18,9 @@ if "processed_video" not in st.session_state:
 if "track_rows" not in st.session_state:
     st.session_state.track_rows = []
 
+if "manual_dohyo" not in st.session_state:
+    st.session_state.manual_dohyo = None
+
 st.title("🤖 Robot Sumo Match Analyzer")
 st.caption("Current scope: per-frame dohyo tracking + AI-assisted two-robot tracking + annotated output video.")
 
@@ -50,6 +53,46 @@ if uploaded_file is not None:
         st.metric("FPS", f"{fps:.2f}")
         st.metric("Frames", total_frames)
 
+    # Calibration helpers: allow manual ellipse fitting when auto-detection is unstable.
+    preview_detector = DohyoDetector()
+    cap_prev = cv2.VideoCapture(input_path)
+    ok_prev, preview_frame = cap_prev.read()
+    cap_prev.release()
+
+    auto_center = (width // 2, height // 2)
+    auto_axes = (int(min(width, height) * 0.8), int(min(width, height) * 0.8))
+    auto_angle = 0.0
+    if ok_prev and preview_frame is not None:
+        preview_detector.detect(preview_frame)
+        if preview_detector.last_detection_info is not None:
+            info = preview_detector.last_detection_info
+            auto_center = info["center"]
+            auto_axes = (int(info["axes"][0]), int(info["axes"][1]))
+            auto_angle = float(info["angle"])
+
+    with st.expander("🎯 Dohyo calibration (manual override)", expanded=False):
+        st.caption("If automatic dohyo detection is wrong, manually adjust center, size, and angle. This does not require training.")
+        use_manual = st.checkbox("Enable manual dohyo ellipse", value=False)
+        lock_manual = st.checkbox("Lock ellipse for entire video", value=True, disabled=not use_manual)
+        cx = st.slider("Center X", 0, max(1, width - 1), int(auto_center[0]), disabled=not use_manual)
+        cy = st.slider("Center Y", 0, max(1, height - 1), int(auto_center[1]), disabled=not use_manual)
+        ax1 = st.slider("Axis width (major/minor diameter px)", 20, max(40, width * 2), int(auto_axes[0]), disabled=not use_manual)
+        ax2 = st.slider("Axis height (major/minor diameter px)", 20, max(40, height * 2), int(auto_axes[1]), disabled=not use_manual)
+        ang = st.slider("Angle (degrees)", -90, 90, int(round(auto_angle)), disabled=not use_manual)
+
+        if use_manual and ok_prev and preview_frame is not None:
+            preview_detector.set_manual_ellipse((cx, cy), (ax1, ax2), float(ang), lock=True)
+            preview_overlay = preview_detector.draw_overlay(preview_frame)
+            st.image(cv2.cvtColor(preview_overlay, cv2.COLOR_BGR2RGB), caption="Manual dohyo overlay preview", use_container_width=True)
+            st.session_state.manual_dohyo = {
+                "center": (cx, cy),
+                "axes": (float(ax1), float(ax2)),
+                "angle": float(ang),
+                "lock": bool(lock_manual),
+            }
+        else:
+            st.session_state.manual_dohyo = None
+
     if st.button("🚀 Process and export annotated video", type="primary", use_container_width=True):
         progress = st.progress(0)
         status = st.empty()
@@ -62,6 +105,14 @@ if uploaded_file is not None:
         else:
             status.text("Detecting and tracking dohyo...")
             dohyo = DohyoDetector()
+            manual_dohyo = st.session_state.get("manual_dohyo")
+            if manual_dohyo is not None:
+                dohyo.set_manual_ellipse(
+                    manual_dohyo["center"],
+                    manual_dohyo["axes"],
+                    manual_dohyo["angle"],
+                    lock=manual_dohyo.get("lock", True),
+                )
             center, radius = dohyo.detect(first)
             if center is None or radius is None:
                 st.error("Could not detect dohyo edges.")
