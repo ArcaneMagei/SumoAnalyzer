@@ -1,537 +1,226 @@
-"""
-Robot Sumo Analyzer - Main Application
-Streamlit interface for match video analysis
-"""
+"""Robot Sumo Analyzer - tracking-focused MVP."""
 
-import streamlit as st
-import cv2
-import numpy as np
-import pandas as pd
-from pathlib import Path
-import plotly.graph_objects as go
 from datetime import datetime
 import tempfile
 
-# Page configuration
-st.set_page_config(
-    page_title="Robot Sumo Analyzer",
-    page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+import cv2
+import pandas as pd
+import streamlit as st
 
-# Initialize session state
-if 'processed_video' not in st.session_state:
+from models.dohyo import DohyoDetector
+from tracking.tracker import RobotTracker
+
+
+st.set_page_config(page_title="Robot Sumo Analyzer", page_icon="🤖", layout="wide")
+
+if "processed_video" not in st.session_state:
     st.session_state.processed_video = None
-if 'match_data' not in st.session_state:
-    st.session_state.match_data = None
-if 'robot_database' not in st.session_state:
-    st.session_state.robot_database = {}
+if "track_rows" not in st.session_state:
+    st.session_state.track_rows = []
 
-# Title
+if "manual_dohyo" not in st.session_state:
+    st.session_state.manual_dohyo = None
+
 st.title("🤖 Robot Sumo Match Analyzer")
-st.markdown("---")
+st.caption("Current scope: per-frame dohyo tracking + AI-assisted two-robot tracking + annotated output video.")
 
-# Sidebar
 with st.sidebar:
-    st.header("⚙️ Settings")
-    
-    # Detection settings
-    st.subheader("Detection")
-    confidence_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.5, 0.05)
-    use_auto_calibration = st.checkbox("Auto Dohyo Calibration", value=True)
-    is_slowmo = st.checkbox("Slow Motion Video", value=False)
-    
-    # Strategy thresholds
-    st.subheader("Strategy Classification")
-    positioning_speed = st.number_input("Positioning Max Speed (cm/s)", value=5, step=1)
-    search_speed_min = st.number_input("Search Min Speed (cm/s)", value=10, step=5)
-    search_speed_max = st.number_input("Search Max Speed (cm/s)", value=40, step=5)
-    attack_speed = st.number_input("Attack Min Speed (cm/s)", value=50, step=10)
-    special_rotation = st.number_input("Special Rotation Rate (deg/s)", value=180, step=30)
-    
-    st.markdown("---")
-    st.markdown("**GPU Status:**")
-    try:
-        import torch
-        if torch.cuda.is_available():
-            st.success(f"✅ {torch.cuda.get_device_name(0)}")
+    st.header("⚙️ Processing")
+    min_confidence = st.slider("Minimum confidence to display", 0.0, 1.0, 0.25, 0.05)
+    use_ai_detector = st.checkbox("Use AI robot detector (recommended)", value=True)
+    ai_weights_path = st.text_input("AI weights path (.pt)", value="models/weights/robot_sumo.pt")
+    ai_confidence = st.slider("AI confidence", 0.05, 0.95, 0.20, 0.05)
+
+uploaded_file = st.file_uploader("Choose match video", type=["mp4", "avi", "mov", "mkv"])
+
+if uploaded_file is not None:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        tmp.write(uploaded_file.read())
+        input_path = tmp.name
+
+    cap = cv2.VideoCapture(input_path)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    cap.release()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.video(uploaded_file)
+    with c2:
+        st.metric("Resolution", f"{width}x{height}")
+        st.metric("FPS", f"{fps:.2f}")
+        st.metric("Frames", total_frames)
+
+    # Calibration helpers: allow manual ellipse fitting when auto-detection is unstable.
+    preview_detector = DohyoDetector()
+    cap_prev = cv2.VideoCapture(input_path)
+    ok_prev, preview_frame = cap_prev.read()
+    cap_prev.release()
+
+    auto_center = (width // 2, height // 2)
+    auto_axes = (int(min(width, height) * 0.8), int(min(width, height) * 0.8))
+    auto_angle = 0.0
+    if ok_prev and preview_frame is not None:
+        preview_detector.detect(preview_frame)
+        if preview_detector.last_detection_info is not None:
+            info = preview_detector.last_detection_info
+            auto_center = info["center"]
+            auto_axes = (int(info["axes"][0]), int(info["axes"][1]))
+            auto_angle = float(info["angle"])
+
+    with st.expander("🎯 Dohyo calibration (manual override)", expanded=False):
+        st.caption("If automatic dohyo detection is wrong, manually adjust center, size, and angle. This does not require training.")
+        use_manual = st.checkbox("Enable manual dohyo ellipse", value=False)
+        lock_manual = st.checkbox("Lock ellipse for entire video", value=True, disabled=not use_manual)
+        cx = st.slider("Center X", 0, max(1, width - 1), int(auto_center[0]), disabled=not use_manual)
+        cy = st.slider("Center Y", 0, max(1, height - 1), int(auto_center[1]), disabled=not use_manual)
+        ax1 = st.slider("Axis width (major/minor diameter px)", 20, max(40, width * 2), int(auto_axes[0]), disabled=not use_manual)
+        ax2 = st.slider("Axis height (major/minor diameter px)", 20, max(40, height * 2), int(auto_axes[1]), disabled=not use_manual)
+        ang = st.slider("Angle (degrees)", -90, 90, int(round(auto_angle)), disabled=not use_manual)
+
+        if use_manual and ok_prev and preview_frame is not None:
+            preview_detector.set_manual_ellipse((cx, cy), (ax1, ax2), float(ang), lock=True)
+            preview_overlay = preview_detector.draw_overlay(preview_frame)
+            st.image(cv2.cvtColor(preview_overlay, cv2.COLOR_BGR2RGB), caption="Manual dohyo overlay preview", use_container_width=True)
+            st.session_state.manual_dohyo = {
+                "center": (cx, cy),
+                "axes": (float(ax1), float(ax2)),
+                "angle": float(ang),
+                "lock": bool(lock_manual),
+            }
         else:
-            st.warning("⚠️ CUDA not available")
-    except:
-        st.error("❌ PyTorch not installed")
+            st.session_state.manual_dohyo = None
 
-# Main tabs
-tab1, tab2, tab3 = st.tabs(["📹 Video Processing", "📊 Match Analysis", "🗄️ Robot Database"])
+    if st.button("🚀 Process and export annotated video", type="primary", use_container_width=True):
+        progress = st.progress(0)
+        status = st.empty()
 
-# ============================================================================
-# TAB 1: VIDEO PROCESSING
-# ============================================================================
-with tab1:
-    st.header("Upload and Process Match Video")
-    
-    # File uploader
-    uploaded_file = st.file_uploader(
-        "Choose a match video",
-        type=['mp4', 'avi', 'mov', 'mkv'],
-        help="Upload a video file of a robot sumo match"
-    )
-    
-    if uploaded_file is not None:
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
-            tmp_file.write(uploaded_file.read())
-            video_path = tmp_file.name
-        
-        # Display video info
-        col1, col2 = st.columns(2)
-        with col1:
-            st.info(f"📁 File: {uploaded_file.name}")
-            st.info(f"💾 Size: {uploaded_file.size / 1024 / 1024:.2f} MB")
-        
-        # Video preview
-        st.subheader("Video Preview")
-        video_col1, video_col2 = st.columns(2)
-        
-        with video_col1:
-            st.video(uploaded_file)
-        
-        with video_col2:
-            # Get video properties
-            cap = cv2.VideoCapture(video_path)
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            duration = frame_count / fps if fps > 0 else 0
+        cap = cv2.VideoCapture(input_path)
+        ok, first = cap.read()
+        if not ok:
+            st.error("Could not read video.")
             cap.release()
-            
-            st.metric("Resolution", f"{width}x{height}")
-            st.metric("Frame Rate", f"{fps} FPS")
-            st.metric("Duration", f"{duration:.2f}s")
-            st.metric("Total Frames", frame_count)
-        
-        # Manual calibration option
-        if not use_auto_calibration:
-            st.subheader("Manual Dohyo Calibration")
-            st.info("Click 3 points on the white line in the first frame")
-            # Placeholder for manual calibration interface
-            st.warning("⚠️ Manual calibration UI - Coming in next update")
-        
-        # Process button
-        st.markdown("---")
-        if st.button("🚀 Analyze Match", type="primary", use_container_width=True):
-            with st.spinner("Processing video... This may take 30-60 seconds"):
-                try:
-                    # Import processing modules
-                    from models.detector import RobotDetector
-                    from models.dohyo import DohyoDetector
-                    from models.homography import HomographyTransform
-                    from tracking.tracker import RobotTracker
-                    from strategy.classifier import StrategyClassifier
-                    
-                    # Progress tracking
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    # Step 1: Initialize detectors
-                    status_text.text("Initializing models...")
-                    detector = RobotDetector(confidence=confidence_threshold)
-                    dohyo_detector = DohyoDetector()
-                    progress_bar.progress(10)
-                    
-                    # Step 2: Detect dohyo
-                    status_text.text("Detecting dohyo...")
-                    cap = cv2.VideoCapture(video_path)
-                    ret, first_frame = cap.read()
-                    if not ret:
-                        st.error("Failed to read video")
-                        cap.release()
+        else:
+            status.text("Detecting and tracking dohyo...")
+            dohyo = DohyoDetector()
+            manual_dohyo = st.session_state.get("manual_dohyo")
+            if manual_dohyo is not None:
+                dohyo.set_manual_ellipse(
+                    manual_dohyo["center"],
+                    manual_dohyo["axes"],
+                    manual_dohyo["angle"],
+                    lock=manual_dohyo.get("lock", True),
+                )
+            center, radius = dohyo.detect(first)
+            if center is None or radius is None:
+                st.error("Could not detect dohyo edges.")
+                cap.release()
+            else:
+                tracker = RobotTracker(
+                    ai_weights_path=ai_weights_path if use_ai_detector else None,
+                    ai_confidence=ai_confidence,
+                )
+                if use_ai_detector:
+                    if tracker.ai_enabled:
+                        st.info(f"AI detector loaded: {ai_weights_path}")
                     else:
-                        # Expect detect() -> (center, radius) or None/None
-                        center, radius = dohyo_detector.detect(first_frame)
+                        st.warning("AI detector unavailable (missing weights/deps). Falling back to classical CV. See docs/AI_WEIGHTS_SETUP.md for full setup.")
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-                        if center is None or radius is None:
-                            st.error("Dohyo not detected. Try manual calibration.")
-                            cap.release()
-                        else:
-                            progress_bar.progress(20)
+                out_path = tempfile.NamedTemporaryFile(delete=False, suffix="_annotated.mp4").name
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(out_path, fourcc, fps if fps > 0 else 30.0, (width, height))
 
-                            # 77 cm radius, dohyo_detector should have a method or use known size
-                            # If DohyoDetector has get_physical_scale(radius): use that
-                            try:
-                                scale = dohyo_detector.get_physical_scale(radius)  # px per cm
-                            except AttributeError:
-                                # Fallback: assume 77 cm radius
-                                scale = radius / 77.0
+                rows = []
+                frame_idx = 0
+                preview_slot = st.empty()
 
-                            dohyo_result = {
-                                "center": center,
-                                "radius": radius,
-                                "scale": scale,      # ← REQUIRED by HomographyTransform
-                                "shape": "circle",
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+
+                    # Update dohyo per-frame to handle camera movement and perspective changes.
+                    d_center, d_radius = dohyo.track(frame)
+                    if d_center is None or d_radius is None or dohyo.last_detection_info is None:
+                        annotated = frame.copy()
+                        cv2.putText(annotated, "DOHYO LOST", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                        writer.write(annotated)
+                        frame_idx += 1
+                        continue
+
+                    tracks = tracker.update(frame, dohyo.last_detection_info)
+
+                    # Draw dohyo references first: outer edge, white border inner edge, center cross
+                    annotated = dohyo.draw_overlay(frame)
+                    # Draw robots
+                    tracks_vis = tracker.draw_tracks(annotated)
+                    annotated = tracks_vis
+
+                    # De-emphasize low-confidence boxes in final export.
+                    if min_confidence > 0:
+                        for rid, state in tracks.items():
+                            if state.confidence < min_confidence:
+                                x, y, w, h = state.bbox_img
+                                cv2.rectangle(annotated, (x, y), (x + w, y + h), (110, 110, 110), 1)
+
+                    writer.write(annotated)
+
+                    if frame_idx % 20 == 0:
+                        preview_slot.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), caption=f"Frame {frame_idx}")
+
+                    for rid, state in tracks.items():
+                        rows.append(
+                            {
+                                "frame": frame_idx,
+                                "time_s": frame_idx / (fps if fps > 0 else 30.0),
+                                "robot_id": rid,
+                                "bbox_x": state.bbox_img[0],
+                                "bbox_y": state.bbox_img[1],
+                                "bbox_w": state.bbox_img[2],
+                                "bbox_h": state.bbox_img[3],
+                                "center_x": state.center_img[0],
+                                "center_y": state.center_img[1],
+                                "front_x": state.front_img[0],
+                                "front_y": state.front_img[1],
+                                "heading_deg": state.heading_deg,
+                                "in_dohyo": state.in_dohyo,
+                                "eliminated": state.eliminated,
+                                "confidence": state.confidence,
+                                "dohyo_center_x": dohyo.last_detection_info["center"][0],
+                                "dohyo_center_y": dohyo.last_detection_info["center"][1],
                             }
+                        )
 
-                            # If your detector stores ellipse info, propagate it
-                            if getattr(dohyo_detector, "last_detection_info", None):
-                                info = dohyo_detector.last_detection_info
-                                if info.get("shape") == "ellipse":
-                                    dohyo_result["shape"] = "ellipse"
-                                    # params typically (d1, d2, angle)
-                                    if "params" in info:
-                                        dohyo_result["params"] = info["params"]
+                    frame_idx += 1
+                    if total_frames > 0 and frame_idx % 5 == 0:
+                        progress.progress(min(100, int(100 * frame_idx / total_frames)))
 
-                            # Step 3: Setup homography
-                            status_text.text("Calibrating perspective transform...")
-                            homography = HomographyTransform(dohyo_result)
+                cap.release()
+                writer.release()
+                progress.progress(100)
+                status.text("✅ Done")
 
-                            progress_bar.progress(30)
-                            
-                            # Step 4: Process video
-                            status_text.text("Detecting and tracking robots...")
-                            tracker = RobotTracker(dohyo_center=center, dohyo_radius=radius)
+                st.session_state.processed_video = out_path
+                st.session_state.track_rows = rows
 
-                            strategy_classifier = StrategyClassifier(
-                                positioning_speed=positioning_speed,
-                                search_speed=(search_speed_min, search_speed_max),
-                                attack_speed=attack_speed,
-                                special_rotation=special_rotation
-                            )
-                            
-                            all_detections = []
-                            frame_idx = 0
-                            
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                            
-                            while True:
-                                ret, frame = cap.read()
-                                if not ret:
-                                    break
-                                
-                                # Detect robots
-                                detections = detector.detect(frame)
-                                
-                                # Track robots
-                                robots_dict = tracker.update(frame)  # Dict[int, RobotState]
+                st.success("Annotated video generated.")
 
-                                # Filter: keep only highest confidence robots inside dohyo (max 2)
-                                candidates = []
-                                for robot_id, robot_state in robots_dict.items():
-                                    if (robot_state.confidence > 0.3 and  # confidence threshold
-                                        len(robot_state.position_history) > 3):  # tracked for a while
-                                        candidates.append((robot_id, robot_state))
+if st.session_state.processed_video:
+    st.subheader("Annotated output")
+    st.video(st.session_state.processed_video)
 
-                                # Sort by confidence, take top 2
-                                candidates.sort(key=lambda x: x[1].confidence, reverse=True)
-                                top_robots = dict(candidates[:2])
-
-                                # Convert to list of dicts for compatibility
-                                tracked_robots = []
-                                for robot_id, robot_state in robots_dict.items():
-                                    robot_dict = {
-                                        "id": robot_id,
-                                        "center": robot_state.position,  # RobotState.position is tuple (x, y)
-                                        "bbox": robot_state.bbox,
-                                        "velocity": robot_state.velocity,
-                                        "confidence": robot_state.confidence,
-                                        "top_down_pos": None,  # Will be filled
-                                    }
-                                    tracked_robots.append(robot_dict)
-
-                                # Transform to top-down
-                                for robot in tracked_robots:
-                                    robot["top_down_pos"] = homography.transform_point(robot["center"])
-
-                                all_detections.append({
-                                    'frame': frame_idx,
-                                    'timestamp': frame_idx / fps,
-                                    'robots': tracked_robots
-                                })
-                                # Live preview every 30 frames
-                                show_preview = st.session_state.get("show_preview", True)
-                                if frame_idx % 30 == 0 and show_preview:
-                                    # Draw visualization
-                                    vis_frame = frame.copy()
-                                    
-                                    # Draw dohyo
-                                    cv2.circle(vis_frame, center, radius, (0, 255, 0), 3)
-                                    
-                                    # Draw robots
-                                    for robot in tracked_robots:
-                                        cv2.rectangle(vis_frame, 
-                                                    (robot["bbox"][0], robot["bbox"][1]), 
-                                                    (robot["bbox"][0] + robot["bbox"][2], robot["bbox"][1] + robot["bbox"][3]), 
-                                                    (0, 255, 0), 2)
-                                        cv2.circle(vis_frame, robot["center"], 8, (0, 0, 255), -1)
-                                        cv2.putText(vis_frame, f"R{robot['id']}:{robot['confidence']:.1f}", 
-                                                (robot["center"][0]-30, robot["center"][1]-10),
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                                    
-                                    # Show in Streamlit (resize for preview)
-                                    preview_img = cv2.cvtColor(vis_frame, cv2.COLOR_BGR2RGB)
-                                    preview_img = cv2.resize(preview_img, (640, 480))
-                                    
-                                    # Store in session state for display
-                                    if "preview_frames" not in st.session_state:
-                                        st.session_state.preview_frames = []
-                                    st.session_state.preview_frames.append(preview_img)
-                                    
-                                    if len(st.session_state.preview_frames) > 20:  # Keep last 20 frames
-                                        st.session_state.preview_frames.pop(0)
-                                
-                                frame_idx += 1
-                                if frame_idx % 10 == 0:
-                                    progress = 30 + int((frame_idx / frame_count) * 40)
-                                    progress_bar.progress(min(progress, 70))
-                            
-                            cap.release()
-                            progress_bar.progress(75)
-                            
-                            # Step 5: Classify strategies
-                            status_text.text("Classifying strategies...")
-                            match_data = strategy_classifier.classify_match(all_detections)
-                            progress_bar.progress(90)
-                            
-                            # Step 6: Generate visualizations
-                            status_text.text("Generating visualizations...")
-                            # Store results in session state
-                            st.session_state.match_data = match_data
-                            st.session_state.video_path = video_path
-                            progress_bar.progress(100)
-                            
-                            status_text.text("✅ Processing complete!")
-                            st.success("Match analyzed successfully!")
-                            st.balloons()
-                
-                except Exception as e:
-                    st.error(f"Error during processing: {str(e)}")
-                    st.exception(e)
-    # Live Preview Section
-    st.subheader("🔴 Live Processing Preview")
-    if hasattr(st.session_state, "preview_frames") and st.session_state.preview_frames:
-        latest_preview = st.session_state.preview_frames[-1]
-        st.image(latest_preview, caption=f"Frame {frame_idx} Preview")
-    else:
-        st.info("Processing preview will appear here...")
-# ============================================================================
-# TAB 2: MATCH ANALYSIS
-# ============================================================================
-with tab2:
-    st.header("Match Analysis & Visualization")
-    
-    if st.session_state.match_data is None:
-        st.info("👈 Process a video in the 'Video Processing' tab first")
-    else:
-        match_data = st.session_state.match_data
-        
-        # Summary statistics
-        st.subheader("📈 Match Summary")
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Duration", f"{match_data['duration']:.2f}s")
-        with col2:
-            st.metric("Total Frames", match_data['total_frames'])
-        with col3:
-            st.metric("Robots Detected", len(match_data['robots']))
-        with col4:
-            st.metric("Strategy Changes", match_data['strategy_changes'])
-        
-        # Trajectory plot
-        st.subheader("🗺️ Top-Down Trajectory")
-        
-        fig = go.Figure()
-        
-        # Draw dohyo
-        theta = np.linspace(0, 2*np.pi, 100)
-        dohyo_r = 154 / 2  # cm
-        fig.add_trace(go.Scatter(
-            x=dohyo_r * np.cos(theta),
-            y=dohyo_r * np.sin(theta),
-            mode='lines',
-            line=dict(color='black', width=2),
-            name='Dohyo Outer',
-            showlegend=False
-        ))
-        
-        # Draw white line
-        white_r = dohyo_r - 5
-        fig.add_trace(go.Scatter(
-            x=white_r * np.cos(theta),
-            y=white_r * np.sin(theta),
-            mode='lines',
-            line=dict(color='gray', width=2, dash='dash'),
-            name='White Line',
-            showlegend=False
-        ))
-        
-        # Color mapping for strategies
-        strategy_colors = {
-            'positioning': 'blue',
-            'search': 'green',
-            'attack': 'red',
-            'special': 'orange'
-        }
-        
-        # Plot robot trajectories
-        for robot_id, robot_data in match_data['robots'].items():
-            trajectory = robot_data['trajectory']
-            strategies = robot_data['strategies']
-            
-            # Plot trajectory with color coding
-            x_coords = [p[0] for p in trajectory]
-            y_coords = [p[1] for p in trajectory]
-            
-            fig.add_trace(go.Scatter(
-                x=x_coords,
-                y=y_coords,
-                mode='lines+markers',
-                line=dict(width=3),
-                marker=dict(size=4),
-                name=f"Robot {robot_id}",
-                hovertemplate=f"Robot {robot_id}<br>X: %{{x:.1f}}cm<br>Y: %{{y:.1f}}cm<extra></extra>"
-            ))
-        
-        fig.update_layout(
-            width=800,
-            height=800,
-            xaxis=dict(
-                scaleanchor="y",
-                scaleratio=1,
-                range=[-100, 100],
-                title="X (cm)"
-            ),
-            yaxis=dict(
-                range=[-100, 100],
-                title="Y (cm)"
-            ),
-            title="Robot Trajectories (Top-Down View)",
-            hovermode='closest'
+    with open(st.session_state.processed_video, "rb") as f:
+        st.download_button(
+            "⬇️ Download annotated video",
+            f,
+            file_name=f"sumo_annotated_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4",
+            mime="video/mp4",
         )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Statistics table
-        st.subheader("📊 Robot Statistics")
-        
-        stats_data = []
-        for robot_id, robot_data in match_data['robots'].items():
-            stats_data.append({
-                'Robot ID': robot_id,
-                'Avg Speed (cm/s)': f"{robot_data['avg_speed']:.1f}",
-                'Max Speed (cm/s)': f"{robot_data['max_speed']:.1f}",
-                'Attack Count': robot_data['attack_count'],
-                'Center Time (s)': f"{robot_data['center_time']:.2f}",
-                'Distance (cm)': f"{robot_data['total_distance']:.1f}"
-            })
-        
-        stats_df = pd.DataFrame(stats_data)
-        st.dataframe(stats_df, use_container_width=True)
-        
-        # Strategy timeline
-        st.subheader("⏱️ Strategy Timeline")
-        
-        timeline_fig = go.Figure()
-        
-        for robot_id, robot_data in match_data['robots'].items():
-            strategies = robot_data['strategy_timeline']
-            
-            for strategy_segment in strategies:
-                timeline_fig.add_trace(go.Scatter(
-                    x=[strategy_segment['start'], strategy_segment['end']],
-                    y=[robot_id, robot_id],
-                    mode='lines',
-                    line=dict(
-                        color=strategy_colors.get(strategy_segment['strategy'], 'gray'),
-                        width=20
-                    ),
-                    name=strategy_segment['strategy'],
-                    showlegend=True,
-                    hovertemplate=f"Robot {robot_id}<br>{strategy_segment['strategy']}<br>%{{x:.2f}}s<extra></extra>"
-                ))
-        
-        timeline_fig.update_layout(
-            title="Strategy Timeline by Robot",
-            xaxis_title="Time (seconds)",
-            yaxis_title="Robot ID",
-            height=300,
-            hovermode='closest'
-        )
-        
-        st.plotly_chart(timeline_fig, use_container_width=True)
-        
-        # Export options
-        st.subheader("💾 Export Results")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("Export CSV", use_container_width=True):
-                # Generate CSV data
-                csv_data = match_data['export_csv']()
-                st.download_button(
-                    label="Download CSV",
-                    data=csv_data,
-                    file_name=f"match_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
-                )
-        
-        with col2:
-            if st.button("Export JSON", use_container_width=True):
-                # Generate JSON data
-                import json
-                json_data = json.dumps(match_data, indent=2)
-                st.download_button(
-                    label="Download JSON",
-                    data=json_data,
-                    file_name=f"match_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                    mime="application/json"
-                )
-        
-        with col3:
-            st.button("Export Video", use_container_width=True, disabled=True)
-            st.caption("Coming soon")
 
-# ============================================================================
-# TAB 3: ROBOT DATABASE
-# ============================================================================
-with tab3:
-    st.header("Robot Database & Identity Management")
-    
-    if len(st.session_state.robot_database) == 0:
-        st.info("No robots in database yet. Process some matches to build the database.")
-    else:
-        st.subheader("🤖 Detected Robots")
-        
-        # Robot gallery
-        cols = st.columns(4)
-        for idx, (robot_id, robot_info) in enumerate(st.session_state.robot_database.items()):
-            with cols[idx % 4]:
-                st.image(robot_info['thumbnail'], use_column_width=True)
-                st.caption(f"Robot {robot_id}")
-                
-                # Rename button
-                new_name = st.text_input(
-                    "Name",
-                    value=robot_info.get('name', f"Robot {robot_id}"),
-                    key=f"name_{robot_id}"
-                )
-                
-                if st.button("Update", key=f"update_{robot_id}"):
-                    robot_info['name'] = new_name
-                    st.success(f"Updated to: {new_name}")
-                
-                # Statistics
-                st.metric("Matches", robot_info['match_count'])
-                st.metric("Win Rate", f"{robot_info['win_rate']*100:.1f}%")
-
-# Footer
-st.markdown("---")
-st.markdown(
-    """
-    <div style='text-align: center'>
-        <p>Robot Sumo Analyzer v1.0 | Built for 3kg Mega Sumo Analysis</p>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+if st.session_state.track_rows:
+    st.subheader("Tracking table")
+    df = pd.DataFrame(st.session_state.track_rows)
+    st.dataframe(df.tail(200), use_container_width=True)
